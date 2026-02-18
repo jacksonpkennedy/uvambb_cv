@@ -1,0 +1,21 @@
+# ByteTrack settings — tuned for YOLO11s player tracking
+# https://arxiv.org/abs/2110.06864
+#
+# YOLO11s is trained on COCO with ~100K person instances, so its confidence
+# scores are reliable.  Use standard thresholds (unlike bytetrack_custom.yaml
+# which runs at very low thresholds to compensate for YOLOE text-prompt recall).
+
+tracker_type: bytetrack
+
+track_high_thresh: 0.50    # first-pass association min confidence
+track_low_thresh: 0.10     # second-pass (rescue) min confidence
+
+new_track_thresh: 0.45     # min confidence to spawn a new track
+
+# Keep lost tracks alive for 1.5 s at 60 fps before deleting.
+# Prevents IDs flipping when a player is briefly occluded.
+track_buffer: 90           # frames (90 ≈ 1.5 s at 60 fps)
+
+match_thresh: 0.85         # IoU threshold for data association
+
+fuse_score: True

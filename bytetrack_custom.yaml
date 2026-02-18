@@ -1,0 +1,23 @@
+# ByteTrack settings — tuned for basketball player tracking
+# https://arxiv.org/abs/2110.06864
+
+tracker_type: bytetrack
+
+# Lower thresholds so more detections are considered for association.
+# Default high thresh is 0.5, which drops most text-prompt YOLOE scores.
+track_high_thresh: 0.15    # first-pass association min confidence (was 0.20)
+track_low_thresh: 0.05     # second-pass (rescue) association min confidence
+
+# Lower new_track_thresh so players at the edges of the frame get their
+# own stable ID sooner instead of waiting for higher-confidence frames.
+new_track_thresh: 0.10     # min confidence to spawn a brand-new track (was 0.15)
+
+# Keep lost tracks alive for 1.5 s at 60 fps before deleting them.
+# Prevents IDs flipping when a player is briefly occluded or off-screen.
+track_buffer: 90           # frames (was 60; 90 ≈ 1.5 s at 60 fps)
+
+# Very permissive IoU matching so fast-moving players re-associate
+# rather than spawning duplicate tracks.
+match_thresh: 0.92         # (was 0.90)
+
+fuse_score: True
