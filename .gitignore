@@ -3,3 +3,5 @@
 /output
 /.vscode
 test.mp4
+*.ts
+*.pt
