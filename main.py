@@ -1,25 +1,33 @@
 """
 UVA Men's Basketball CV Pipeline — Detection + Tracking + Pose
+
 Usage:
-  Inference : python main.py [--video data/game_01.mp4] [--out output/]
-  Finetune  : python main.py --finetune [--epochs 50] [--batch 8]
-  Custom    : python main.py --custom-model runs/detect/train/weights/best.pt --video ...
+  Fine-tune : python main.py --finetune [--epochs 250] [--batch 16]
+  Inference : python main.py [--video data/game_01.mp4] [--weights path/to/best.pt]
+
+Dataset (data/custom_annotations/data.yaml):
+  nc: 4
+  names: [basketball, hoop, players, referee]   # IDs must match CLS_* constants below
 """
 
 import argparse
 import math
+import re
 import time
 from collections import deque
 from pathlib import Path
 
 import cv2
+import easyocr
 import numpy as np
 import torch
-from ultralytics import YOLO, YOLOE
+from sahi import AutoDetectionModel
+from sahi.predict import get_sliced_prediction
+from ultralytics import YOLO
 
 
 # ---------------------------------------------------------------------------
-# Device + model helpers
+# Device
 # ---------------------------------------------------------------------------
 
 def get_device() -> str:
@@ -33,65 +41,52 @@ def get_device() -> str:
     return "cpu"
 
 
-def ensure_model(model_name: str) -> str:
-    """
-    Guard against OneDrive Files-On-Demand stubs.
-    If the local file can't be read, delete it so ultralytics re-downloads.
-    """
-    p = Path(model_name)
-    if p.exists():
-        try:
-            with open(p, "rb") as f:
-                f.read(4)
-        except OSError:
-            print(f"WARNING: {model_name} is unreadable (OneDrive stub). Deleting ...")
-            p.unlink()
-            return p.name
-    return model_name
-
-
 # ---------------------------------------------------------------------------
-# Config
+# Config — class IDs must match names order in data/custom_annotations/data.yaml
 # ---------------------------------------------------------------------------
 
-# YOLOE handles ball, hoop, and referee; players are detected by yolo11s
-YOLOE_PROMPTS = ["basketball", "hoop", "referee"]
-LABEL_BALL    = "basketball"
-LABEL_HOOP    = "hoop"
-LABEL_REF     = "referee"
+CLS_BALL   = 0   # "basketball"
+CLS_HOOP   = 1   # "hoop"
+CLS_PLAYER = 2   # "players"
+CLS_REF    = 3   # "referee"
 
-LABEL_PLAYER  = "player"
+LABEL_PLAYER = "player"        # internal tag for TrackMemory / pose association
 
-# Custom fine-tuned model class IDs (data.yaml: basketball=0, hoop=1, players=2, referee=3)
-CUSTOM_CLS_BALL    = 0
-CUSTOM_CLS_HOOP    = 1
-CUSTOM_CLS_PLAYER  = 2
-CUSTOM_CLS_REF     = 3
+C_PLAYER = (0,   255,   0)     # BGR green
+C_BALL   = (0,     0, 255)     # red
+C_HOOP   = (255, 255, 255)     # white
+C_REF    = (180,  60,  20)     # dark blue
 
-# Annotation colours (BGR)
-C_PLAYER    = (0,   255,   0)    # green
-C_BALL      = (0,   165, 255)    # orange
-C_HOOP      = (0,   215, 255)    # gold
-C_REF       = (200, 200, 200)    # light grey
+REID_BUFFER_FRAMES = 180    # frames to remember lost player tracks (~3s at 60fps)
+REID_DIST_THRESH   = 300    # max pixel distance to re-associate a lost player track
 
-# Temporal re-ID
-REID_BUFFER_FRAMES = 10
-REID_DIST_THRESH   = 150
+BALL_REID_BUFFER   = 240    # frames to remember lost ball track (~4s at 60fps)
+BALL_REID_DIST     = 500    # ball moves fast — allow wider re-association radius
 
-# Velocity tracker / overlap detection
-IOU_CRASH_THRESH = 0.40
-VEL_HISTORY_LEN  = 15
-VEL_EXIT_THRESH  = 80
+IOU_CRASH_THRESH   = 0.40
+VEL_HISTORY_LEN    = 15
+VEL_EXIT_THRESH    = 80
 
-# Pose skeleton constants (COCO 17 keypoints)
+# SAHI — targeted inference around ball's last known position
+SAHI_CROP_PAD      = 250    # pixels to pad around last known ball center for SAHI crop
+SAHI_CONF_THRESH   = 0.10   # lower conf OK — we're zooming into a small region
+SAHI_SLICE_SIZE    = 160    # slice size within the cropped region
+SAHI_OVERLAP_RATIO = 0.25   # overlap between slices within the crop
+SAHI_MAX_LOST      = 60     # max frames since last ball sighting to run targeted SAHI
+
+# Jersey OCR
+OCR_INTERVAL       = 30     # run OCR every N frames (performance vs accuracy)
+OCR_CONFIRM_COUNT  = 2      # need this many consistent reads to lock a jersey number
+
+
 _G = (0, 255, 0)
 SKELETON_EDGES = [
-    (0,  1,  _G), (0,  2,  _G), (1,  3,  _G), (2,  4,  _G),
-    (5,  6,  _G), (5,  7,  _G), (7,  9,  _G), (6,  8,  _G),
-    (8,  10, _G), (5,  11, _G), (6,  12, _G), (11, 12, _G),
-    (11, 13, _G), (13, 15, _G), (12, 14, _G), (14, 16, _G),
+    (0,  1, _G), (0,  2, _G), (1,  3, _G), (2,  4, _G),
+    (5,  6, _G), (5,  7, _G), (7,  9, _G), (6,  8, _G),
+    (8, 10, _G), (5, 11, _G), (6, 12, _G), (11, 12, _G),
+    (11,13, _G), (13, 15, _G), (12, 14, _G), (14, 16, _G),
 ]
-KP_COLORS = [_G] * 17
+KP_COLORS      = [_G] * 17
 KP_CONF_THRESH = 0.30
 
 
@@ -138,7 +133,7 @@ class TrackMemory:
 
 
 # ---------------------------------------------------------------------------
-# Temporal Re-ID Buffer (Feature 2)
+# Temporal Re-ID Buffer
 # ---------------------------------------------------------------------------
 
 class TemporalReIDBuffer:
@@ -184,7 +179,7 @@ class TemporalReIDBuffer:
 
 
 # ---------------------------------------------------------------------------
-# Velocity Tracker — overlap/eclipse ID preservation (Feature 4)
+# Velocity Tracker — overlap/eclipse ID preservation
 # ---------------------------------------------------------------------------
 
 def bbox_iou(a, b):
@@ -265,7 +260,215 @@ class VelocityTracker:
 
 
 # ---------------------------------------------------------------------------
-# Court ROI — lightweight polygon check (no HSV colour scoring)
+# Jersey Number OCR — identify players by jersey number
+# ---------------------------------------------------------------------------
+
+class JerseyOCR:
+    """Crop the torso region of player bboxes, run EasyOCR, and cache jersey numbers."""
+
+    def __init__(self):
+        self._reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available(), verbose=False)
+        self._confirmed: dict[int, str]       = {}   # tid → locked jersey number
+        self._candidates: dict[int, dict]     = {}   # tid → {number: count, ...}
+
+    def get_jersey(self, tid: int) -> str | None:
+        return self._confirmed.get(tid)
+
+    def scan(self, frame: np.ndarray, detections: list):
+        """Run OCR on player crops. Call every OCR_INTERVAL frames."""
+        for d in detections:
+            tid = d["tid"]
+            if tid in self._confirmed:
+                continue
+            box = d["box"]
+            # Crop upper 55% of bbox (torso/jersey area)
+            x1, y1, x2, y2 = box
+            h = y2 - y1
+            crop_y2 = y1 + int(h * 0.55)
+            # Slight horizontal padding inward to avoid arms
+            w = x2 - x1
+            crop_x1 = x1 + int(w * 0.15)
+            crop_x2 = x2 - int(w * 0.15)
+            if crop_x2 <= crop_x1 or crop_y2 <= y1:
+                continue
+            crop = frame[max(0, y1):crop_y2, max(0, crop_x1):crop_x2]
+            if crop.size == 0:
+                continue
+
+            results = self._reader.readtext(crop, allowlist="0123456789",
+                                            paragraph=False, min_size=10)
+            for (_, text, conf) in results:
+                text = text.strip()
+                # Filter to valid jersey numbers (1-99)
+                if not re.match(r"^\d{1,2}$", text):
+                    continue
+                num = int(text)
+                if num < 0 or num > 99:
+                    continue
+                jersey = str(num)
+                if tid not in self._candidates:
+                    self._candidates[tid] = {}
+                self._candidates[tid][jersey] = self._candidates[tid].get(jersey, 0) + 1
+                # Lock once we see the same number enough times
+                if self._candidates[tid][jersey] >= OCR_CONFIRM_COUNT:
+                    self._confirmed[tid] = jersey
+                    self._candidates.pop(tid, None)
+                    break
+
+    def transfer_id(self, old_tid: int, new_tid: int):
+        """When Re-ID remaps a track, carry the jersey number over."""
+        if old_tid in self._confirmed:
+            self._confirmed[new_tid] = self._confirmed[old_tid]
+
+
+# ---------------------------------------------------------------------------
+# Ball Tracker — interpolation + trajectory prediction for ball occlusions
+# ---------------------------------------------------------------------------
+
+class BallTracker:
+    """Track ball detections — pick best detection per frame, no interpolation.
+    Stores last known position so SAHI can target that region."""
+
+    def __init__(self):
+        self._last_box: list | None = None
+        self._last_seen_frame: int = -999
+
+    @property
+    def last_center(self) -> tuple | None:
+        """Return (cx, cy) of last known ball position, or None."""
+        if self._last_box is None:
+            return None
+        b = self._last_box
+        return ((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0)
+
+    @property
+    def frames_since_seen(self) -> int:
+        return self._frames_since
+
+    def update(self, frame_idx: int, ball_dets: list) -> list:
+        """Return only real ball detections (no predictions)."""
+        self._frames_since = frame_idx - self._last_seen_frame
+        if not ball_dets:
+            return []
+        # Pick largest detection (most likely the real ball, not noise)
+        best = max(ball_dets, key=lambda d: (d["box"][2]-d["box"][0]) * (d["box"][3]-d["box"][1]))
+        self._last_box = best["box"]
+        self._last_seen_frame = frame_idx
+        return [best]
+
+
+class BallReID:
+    """Keep the ball's track ID stable across occlusions.
+    When ByteTrack assigns a new tid to the ball after a gap,
+    remap it back to the original tid."""
+
+    def __init__(self):
+        self._canonical_tid: int | None = None   # the "real" ball track ID
+        self._last_center: tuple | None = None
+        self._last_frame: int = -999
+
+    def update(self, frame_idx: int, ball_dets: list) -> list:
+        if not ball_dets:
+            return ball_dets
+
+        for d in ball_dets:
+            tid = d["tid"]
+            if tid == -1:
+                # SAHI detection without a tracker ID — assign canonical
+                if self._canonical_tid is not None:
+                    d["tid"] = self._canonical_tid
+                continue
+
+            cx = (d["box"][0] + d["box"][2]) / 2.0
+            cy = (d["box"][1] + d["box"][3]) / 2.0
+
+            if self._canonical_tid is None:
+                # First ball detection ever
+                self._canonical_tid = tid
+            elif tid != self._canonical_tid:
+                # ByteTrack assigned a new ID — check if it's the same ball
+                gap = frame_idx - self._last_frame
+                if gap <= BALL_REID_BUFFER and self._last_center is not None:
+                    dist = math.hypot(cx - self._last_center[0],
+                                      cy - self._last_center[1])
+                    if dist < BALL_REID_DIST:
+                        d["tid"] = self._canonical_tid
+                    else:
+                        # Too far — accept new track as the ball
+                        self._canonical_tid = tid
+                else:
+                    # Too long since last seen — accept new ID
+                    self._canonical_tid = tid
+
+            self._last_center = (cx, cy)
+            self._last_frame = frame_idx
+
+        return ball_dets
+
+
+# ---------------------------------------------------------------------------
+# SAHI — targeted inference around ball's last known position
+# ---------------------------------------------------------------------------
+
+def run_sahi_ball_targeted(
+    sahi_model: AutoDetectionModel,
+    frame: np.ndarray,
+    center: tuple,
+    existing_ball_dets: list,
+) -> list:
+    """Run SAHI on a small crop around the ball's last known position.
+    Much faster than full-frame slicing — only processes the region
+    where the ball is likely to be."""
+    cx, cy = center
+    h, w = frame.shape[:2]
+
+    # Crop region around last known ball center
+    x1 = max(0, int(cx - SAHI_CROP_PAD))
+    y1 = max(0, int(cy - SAHI_CROP_PAD))
+    x2 = min(w, int(cx + SAHI_CROP_PAD))
+    y2 = min(h, int(cy + SAHI_CROP_PAD))
+
+    if x2 - x1 < 50 or y2 - y1 < 50:
+        return []
+
+    crop = frame[y1:y2, x1:x2]
+
+    result = get_sliced_prediction(
+        image=crop,
+        detection_model=sahi_model,
+        slice_height=SAHI_SLICE_SIZE,
+        slice_width=SAHI_SLICE_SIZE,
+        overlap_height_ratio=SAHI_OVERLAP_RATIO,
+        overlap_width_ratio=SAHI_OVERLAP_RATIO,
+        postprocess_type="NMS",
+        postprocess_match_threshold=0.40,
+        verbose=0,
+    )
+
+    sahi_balls: list = []
+    for pred in result.object_prediction_list:
+        if int(pred.category.id) != CLS_BALL:
+            continue
+        if pred.score.value < SAHI_CONF_THRESH:
+            continue
+        bb = pred.bbox
+        # Remap crop coordinates back to full frame
+        box = [int(bb.minx) + x1, int(bb.miny) + y1,
+               int(bb.maxx) + x1, int(bb.maxy) + y1]
+        # Skip if it largely overlaps an existing ball detection
+        dup = False
+        for ed in existing_ball_dets:
+            if bbox_iou(box, ed["box"]) > 0.30:
+                dup = True
+                break
+        if not dup:
+            sahi_balls.append({"tid": -1, "box": box, "cls": CLS_BALL})
+
+    return sahi_balls
+
+
+# ---------------------------------------------------------------------------
+# Court ROI — polygon check
 # ---------------------------------------------------------------------------
 
 def build_court_roi(frame_w: int, frame_h: int) -> np.ndarray:
@@ -288,42 +491,27 @@ def in_court_roi(roi_poly: np.ndarray, box: list) -> bool:
 # Drawing helpers
 # ---------------------------------------------------------------------------
 
-def _label_bg(frame, x: int, y: int, text: str, color, scale=0.48, thick=1):
+def _contrast_text(bg_color):
+    """Return black or white text depending on background brightness."""
+    brightness = 0.299 * bg_color[2] + 0.587 * bg_color[1] + 0.114 * bg_color[0]
+    return (0, 0, 0) if brightness > 140 else (255, 255, 255)
+
+
+def _label_bg(frame, x: int, y: int, text: str, bg_color, scale=0.48, thick=1):
     font = cv2.FONT_HERSHEY_SIMPLEX
     (tw, th), bl = cv2.getTextSize(text, font, scale, thick)
-    pad = 2
+    pad = 3
     cv2.rectangle(frame, (x - pad, y - th - pad),
-                  (x + tw + pad, y + bl + pad), (0, 0, 0), -1)
-    cv2.putText(frame, text, (x, y), font, scale, color, thick, cv2.LINE_AA)
+                  (x + tw + pad, y + bl + pad), bg_color, -1)
+    txt_color = _contrast_text(bg_color)
+    cv2.putText(frame, text, (x, y), font, scale, txt_color, thick, cv2.LINE_AA)
 
 
-def draw_player(frame, box, label: str,
-                ghost: bool = False, age: int = 0, max_age: int = 45,
-                color=None):
+def draw_player(frame, box, label: str, color=None):
     x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-    if ghost:
-        alpha = max(0.25, 1.0 - age / max(1, max_age))
-        ghost_color = (0, int(200 * alpha), int(255 * alpha))
-        seg = 12
-        corners = [
-            (x1,       y1,       x1 + seg, y1      ),
-            (x2 - seg, y1,       x2,       y1      ),
-            (x1,       y2,       x1 + seg, y2      ),
-            (x2 - seg, y2,       x2,       y2      ),
-            (x1,       y1,       x1,       y1 + seg),
-            (x1,       y2 - seg, x1,       y2      ),
-            (x2,       y1,       x2,       y1 + seg),
-            (x2,       y2 - seg, x2,       y2      ),
-        ]
-        for c in corners:
-            cv2.line(frame, (c[0], c[1]), (c[2], c[3]), ghost_color, 2)
-        cv2.putText(frame, f"{label}?", (x1, y1 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, ghost_color, 1)
-    else:
-        draw_color = color if color is not None else C_PLAYER
-        cv2.rectangle(frame, (x1, y1), (x2, y2), draw_color, 2)
-        cv2.putText(frame, label, (x1, y1 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, draw_color, 2)
+    draw_color = color if color is not None else C_PLAYER
+    cv2.rectangle(frame, (x1, y1), (x2, y2), draw_color, 3)
+    _label_bg(frame, x1, y1 - 3, label, draw_color, scale=0.55, thick=2)
 
 
 def draw_skeleton(frame: np.ndarray, kps_xy: np.ndarray, kps_conf: np.ndarray):
@@ -341,7 +529,9 @@ def draw_skeleton(frame: np.ndarray, kps_xy: np.ndarray, kps_conf: np.ndarray):
                 cv2.circle(frame, (x, y), 4, (0, 0, 0),    1,  cv2.LINE_AA)
 
 
-def associate_poses(real_dets: list, ghost_dets: list, pose_result) -> dict:
+def associate_poses(real_dets: list, ref_boxes: list, pose_result) -> dict:
+    """Match pose skeletons to player detections only.
+    Excludes any pose that overlaps more with a referee than with any player."""
     associations = {}
     if (pose_result is None
             or pose_result.keypoints is None
@@ -359,41 +549,51 @@ def associate_poses(real_dets: list, ghost_dets: list, pose_result) -> dict:
 
     track_candidates = [
         (d["box"], d["tid"])
-        for d in (real_dets + ghost_dets)
+        for d in real_dets
         if d["label"] == LABEL_PLAYER
     ]
 
     for i, p_box in enumerate(p_boxes):
+        p_box_list = p_box.tolist()
+
+        # Check if this pose overlaps more with a ref than any player
+        best_ref_iou = max(
+            (bbox_iou(p_box_list, rb) for rb in ref_boxes),
+            default=0.0
+        )
+
         best_iou = 0.12
         best_tid = None
         for (y_box, tid) in track_candidates:
-            iou = bbox_iou(p_box.tolist(), y_box)
+            iou = bbox_iou(p_box_list, y_box)
             if iou > best_iou:
                 best_iou = iou
-                best_tid  = tid
-        if best_tid is not None:
+                best_tid = tid
+
+        # Only assign if player overlap beats ref overlap
+        if best_tid is not None and best_iou > best_ref_iou:
             associations[best_tid] = (kps_xy[i], kps_conf[i])
 
     return associations
 
 
-def draw_ball(frame, box, label="BALL"):
+def draw_ball(frame, box, label="BASKETBALL"):
     x1, y1, x2, y2 = map(int, box)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), C_BALL, 2, cv2.LINE_AA)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), C_BALL, 3, cv2.LINE_AA)
     _label_bg(frame, x1, y1 - 3, label, C_BALL)
 
 
 def draw_hoop(frame, box):
     x1, y1, x2, y2 = map(int, box)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), C_HOOP, 2, cv2.LINE_AA)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), C_HOOP, 3, cv2.LINE_AA)
     cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-    cv2.drawMarker(frame, (cx, cy), C_HOOP, cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+    cv2.drawMarker(frame, (cx, cy), C_HOOP, cv2.MARKER_CROSS, 14, 3, cv2.LINE_AA)
     _label_bg(frame, x1, y1 - 3, "HOOP", C_HOOP)
 
 
 def draw_ref(frame, box, tid: int):
     x1, y1, x2, y2 = map(int, box)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), C_REF, 1, cv2.LINE_AA)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), C_REF, 3, cv2.LINE_AA)
     _label_bg(frame, x1, y1 - 3, f"REF#{tid}", C_REF)
 
 
@@ -401,26 +601,22 @@ def draw_ref(frame, box, tid: int):
 # Fine-tuning
 # ---------------------------------------------------------------------------
 
-def finetune(epochs: int = 50, batch: int = 8, imgsz: int = 1920):
-    base_dir = Path(__file__).resolve().parent
+def finetune(epochs: int = 300, batch: int = 8, imgsz: int = 960):
+    base_dir  = Path(__file__).resolve().parent
     data_yaml = str(base_dir / "data" / "custom_annotations" / "data.yaml")
 
     if not Path(data_yaml).exists():
         raise FileNotFoundError(
             f"Dataset config not found: {data_yaml}\n"
-            "Place your Roboflow export in data/custom_annotations/."
+            "Export your Roboflow dataset (YOLO format) to data/custom_annotations/\n"
+            "data.yaml must define: nc=4, names=[basketball, hoop, players, referee]"
         )
 
     device = get_device()
+    print(f"Fine-tuning YOLO11s  |  epochs={epochs}  batch={batch}  "
+          f"imgsz={imgsz}  nbs=64 (grad accum)  device={device}")
 
-    print(f"Fine-tuning YOLO11s on custom dataset")
-    print(f"  data.yaml : {data_yaml}")
-    print(f"  epochs    : {epochs}")
-    print(f"  batch     : {batch}")
-    print(f"  imgsz     : {imgsz}")
-    print(f"  device    : {device}")
-
-    model = YOLO(ensure_model("yolo11s.pt"))
+    model = YOLO("yolo11s.pt")
     model.train(
         data=data_yaml,
         epochs=epochs,
@@ -431,25 +627,47 @@ def finetune(epochs: int = 50, batch: int = 8, imgsz: int = 1920):
         name="train",
         exist_ok=True,
         pretrained=True,
-        hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
-        degrees=0.0, translate=0.1, scale=0.5,
-        flipud=0.0, fliplr=0.5, mosaic=1.0, mixup=0.1,
+        # Gradient accumulation — simulate effective batch of 64
+        # actual batch=8 × 8 accumulation steps = 64 effective batch
+        # smooths gradients without extra VRAM
+        nbs=64,
+        # Learning rate
+        lr0=0.001,
+        lrf=0.01,              # final LR = lr0 * lrf
+        warmup_epochs=10,      # longer warmup for small dataset stability
+        # Regularization — dropout to prevent overfitting on small dataset
+        dropout=0.15,          # randomly drop 15% of features during training
+        weight_decay=0.0005,   # L2 regularization
+        # Augmentation — aggressive to compensate for only ~200 images
+        hsv_h=0.02, hsv_s=0.7, hsv_v=0.4,
+        degrees=10.0,          # rotation — camera angles vary
+        translate=0.2,         # shift images to simulate different framing
+        scale=0.7,             # aggressive scale variation
+        shear=2.0,             # slight shear for perspective variation
+        perspective=0.0005,    # perspective warp — simulates camera angle changes
+        flipud=0.0,
+        fliplr=0.5,
+        mosaic=1.0,            # combine 4 images — creates partial occlusions
+        mixup=0.3,             # blend images — teaches model to see through overlap
+        copy_paste=0.3,        # paste objects onto other backgrounds — synthetic occlusion
+        erasing=0.4,           # randomly erase patches — forces robustness to occlusion
+        crop_fraction=1.0,     # random crop during classification (full image)
+        # Early stopping — patient, small datasets are noisy
+        patience=50,
     )
 
     best_pt = base_dir / "runs" / "detect" / "train" / "weights" / "best.pt"
-    print(f"\nFine-tuning complete.")
-    print(f"  Best weights: {best_pt}")
-    print(f"\nRun the pipeline with:")
-    print(f"  python main.py --custom-model {best_pt} --video data/game_01test.mp4")
-
+    print(f"\nFine-tuning complete.  Best weights: {best_pt}")
+    print(f"Run inference: python main.py --video data/game_01.mp4")
     return str(best_pt)
 
 
 # ---------------------------------------------------------------------------
-# Main pipeline — detection + tracking + pose (no OCR, no events, no play log)
+# Main pipeline
 # ---------------------------------------------------------------------------
 
-def run(video_path: str, out_dir: str, custom_model: str | None = None):
+def run(video_path: str, out_dir: str, weights: str | None = None,
+        use_sahi: bool = True):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     cap = cv2.VideoCapture(video_path)
@@ -464,8 +682,6 @@ def run(video_path: str, out_dir: str, custom_model: str | None = None):
           f"|  {fps:.1f} fps  |  {total_frames} frames")
 
     device = get_device()
-    use_custom = custom_model is not None
-
     if device.startswith("cuda"):
         infer_imgsz = 1920
         use_half    = True
@@ -474,39 +690,46 @@ def run(video_path: str, out_dir: str, custom_model: str | None = None):
         use_half    = False
         print(f"NOTE: Running on CPU with imgsz={infer_imgsz}.")
 
-    # --- Load models ----------------------------------------------------------
-    if use_custom:
-        print(f"Loading CUSTOM model ({custom_model}) — 4-class detection ...")
-        unified_model = YOLO(ensure_model(custom_model))
-        player_model  = None
-        ball_model    = None
-    else:
-        print("Loading YOLO11s (player tracking) ...")
-        player_model = YOLO(ensure_model("yolo11s.pt"))
+    # Resolve weights — default to last fine-tune run
+    base_dir     = Path(__file__).resolve().parent
+    weights_path = weights or str(
+        base_dir / "runs" / "detect" / "train" / "weights" / "best.pt"
+    )
+    if not Path(weights_path).exists():
+        raise FileNotFoundError(
+            f"No fine-tuned model found at: {weights_path}\n"
+            "Run first: python main.py --finetune"
+        )
 
-        print("Loading YOLOE-26 (ball + hoop detection) ...")
-        ball_model = YOLOE(ensure_model("yoloe-26l-seg.pt"))
-        ball_model.set_classes(YOLOE_PROMPTS, ball_model.get_text_pe(YOLOE_PROMPTS))
-        unified_model = None
+    print(f"Loading detection model: {Path(weights_path).name} ...")
+    model = YOLO(weights_path)
 
     print("Loading YOLO11n-pose (skeleton estimation) ...")
     pose_model = YOLO("yolo11n-pose.pt")
 
-    # --- Court ROI (polygon check only, no HSV) ------------------------------
-    roi_poly = build_court_roi(frame_w, frame_h)
+    # SAHI — sliced inference for small ball detection
+    sahi_model = None
+    if use_sahi:
+        print("Loading SAHI sliced-inference model (ball detection) ...")
+        sahi_model = AutoDetectionModel.from_pretrained(
+            model_type="yolov8",          # compatible with YOLO11
+            model_path=weights_path,
+            confidence_threshold=SAHI_CONF_THRESH,
+            device=device,
+        )
 
-    # --- State ----------------------------------------------------------------
+    roi_poly      = build_court_roi(frame_w, frame_h)
     ghost_max_age = int(fps * 1.5)
     memory        = TrackMemory(max_age=ghost_max_age)
     reid_buffer   = TemporalReIDBuffer()
     vel_tracker   = VelocityTracker()
+    tracker_cfg   = str(base_dir / "bytetrack_players.yaml")
 
-    # --- Tracker configs ------------------------------------------------------
-    base_dir       = Path(__file__).resolve().parent
-    player_tracker = str(base_dir / "bytetrack_players.yaml")
-    ball_tracker   = str(base_dir / "bytetrack_custom.yaml")
+    print("Loading EasyOCR (jersey number reader) ...")
+    jersey_ocr    = JerseyOCR()
+    ball_tracker  = BallTracker()
+    ball_reid     = BallReID()
 
-    # --- Output writer --------------------------------------------------------
     fourcc    = cv2.VideoWriter_fourcc(*"mp4v")
     out_video = cv2.VideoWriter(
         str(Path(out_dir) / "annotated.mp4"), fourcc, fps, (frame_w, frame_h)
@@ -524,82 +747,53 @@ def run(video_path: str, out_dir: str, custom_model: str | None = None):
 
         # ---- 1. Detection & tracking -----------------------------------------
         raw_dets       = []
-        ball_hoop_dets = []
+        ball_dets      = []
+        hoop_dets      = []
+        ref_dets       = []
 
-        if use_custom:
-            u_res = unified_model.track(
-                frame, persist=True, tracker=player_tracker,
-                conf=0.30, iou=0.50,
-                imgsz=infer_imgsz, device=device, half=use_half,
-                verbose=False,
-            )[0]
-            if u_res.boxes is not None and u_res.boxes.id is not None:
-                for box, tid, cls_id in zip(
-                        u_res.boxes.xyxy, u_res.boxes.id, u_res.boxes.cls):
-                    box_list = list(map(int, box.tolist()))
-                    tid      = int(tid)
-                    cls_id   = int(cls_id)
+        det_res = model.track(
+            frame, persist=True, tracker=tracker_cfg,
+            conf=0.15, iou=0.45,
+            imgsz=infer_imgsz, device=device, half=use_half,
+            verbose=False,
+        )[0]
 
-                    if cls_id == CUSTOM_CLS_PLAYER:
-                        if (box_list[3] - box_list[1]) < frame_h * 0.08:
-                            continue
-                        if not in_court_roi(roi_poly, box_list):
-                            continue
-                        raw_dets.append({
-                            "tid": tid, "box": box_list, "label": LABEL_PLAYER,
-                        })
-                    else:
-                        ball_hoop_dets.append({
-                            "tid": tid, "box": box_list, "cls": cls_id,
-                        })
-        else:
-            # YOLO11s for players
-            p_res = player_model.track(
-                frame, persist=True, tracker=player_tracker,
-                classes=[0], conf=0.35, iou=0.50,
-                imgsz=infer_imgsz, device=device, half=use_half,
-                verbose=False,
-            )[0]
-            if p_res.boxes is not None and p_res.boxes.id is not None:
-                for box, tid in zip(p_res.boxes.xyxy, p_res.boxes.id):
-                    box_list = list(map(int, box.tolist()))
+        if det_res.boxes is not None and det_res.boxes.id is not None:
+            for box, tid, cls_id, conf in zip(
+                    det_res.boxes.xyxy, det_res.boxes.id,
+                    det_res.boxes.cls, det_res.boxes.conf):
+                box_list = list(map(int, box.tolist()))
+                tid      = int(tid)
+                cls_id   = int(cls_id)
+                conf_val = float(conf)
+
+                if cls_id == CLS_PLAYER:
+                    if conf_val < 0.30:
+                        continue
                     if (box_list[3] - box_list[1]) < frame_h * 0.08:
                         continue
                     if not in_court_roi(roi_poly, box_list):
                         continue
-                    raw_dets.append({
-                        "tid": int(tid), "box": box_list, "label": LABEL_PLAYER,
-                    })
+                    raw_dets.append({"tid": tid, "box": box_list, "label": LABEL_PLAYER})
+                elif cls_id == CLS_BALL:
+                    ball_dets.append({"tid": tid, "box": box_list, "cls": CLS_BALL})
+                elif cls_id == CLS_HOOP:
+                    if conf_val >= 0.30:
+                        hoop_dets.append({"tid": tid, "box": box_list, "cls": CLS_HOOP})
+                elif cls_id == CLS_REF:
+                    if conf_val >= 0.30:
+                        ref_dets.append({"tid": tid, "box": box_list, "cls": CLS_REF})
 
-            # YOLOE for ball/hoop/ref
-            b_res = ball_model.track(
-                frame, persist=True, tracker=ball_tracker,
-                conf=0.07, iou=0.70,
-                imgsz=infer_imgsz, device=device, half=use_half,
-                verbose=False,
-            )[0]
-            if b_res.boxes is not None and len(b_res.boxes.xyxy) > 0:
-                b_ids = b_res.boxes.id
-                for i_b, (box, cls_id) in enumerate(
-                        zip(b_res.boxes.xyxy, b_res.boxes.cls)):
-                    box_list = list(map(int, box.tolist()))
-                    b_tid = int(b_ids[i_b]) if (b_ids is not None) else i_b
-                    yoloe_label = (YOLOE_PROMPTS[int(cls_id)]
-                                   if int(cls_id) < len(YOLOE_PROMPTS) else "?")
-                    if yoloe_label == LABEL_BALL:
-                        cls_mapped = CUSTOM_CLS_BALL
-                    elif yoloe_label == LABEL_HOOP:
-                        cls_mapped = CUSTOM_CLS_HOOP
-                    elif yoloe_label == LABEL_REF:
-                        cls_mapped = CUSTOM_CLS_REF
-                    else:
-                        continue
-                    ball_hoop_dets.append({
-                        "tid": b_tid, "box": box_list, "cls": cls_mapped,
-                    })
+        # ---- 1b. SAHI targeted detection around last known ball position ------
+        if sahi_model is not None and not ball_dets:
+            center = ball_tracker.last_center
+            if center is not None and ball_tracker.frames_since_seen < SAHI_MAX_LOST:
+                sahi_balls = run_sahi_ball_targeted(
+                    sahi_model, frame, center, ball_dets)
+                ball_dets.extend(sahi_balls)
 
         # ---- 2. Re-ID + memory + velocity ------------------------------------
-        raw_dets = reid_buffer.update(frame_idx, raw_dets)
+        raw_dets              = reid_buffer.update(frame_idx, raw_dets)
         real_dets, ghost_dets = memory.update(frame_idx, raw_dets)
         reid_buffer.register_lost(frame_idx, ghost_dets)
 
@@ -607,75 +801,84 @@ def run(video_path: str, out_dir: str, custom_model: str | None = None):
         if vel_remap:
             for d in real_dets:
                 if d["tid"] in vel_remap:
-                    d["tid"] = vel_remap[d["tid"]]
+                    old_tid = d["tid"]
+                    d["tid"] = vel_remap[old_tid]
+                    jersey_ocr.transfer_id(vel_remap[old_tid], d["tid"])
 
-        # ---- 3. Pose estimation ----------------------------------------------
+        # ---- 3. Jersey OCR (every N frames) ----------------------------------
+        if frame_idx % OCR_INTERVAL == 0:
+            jersey_ocr.scan(frame, real_dets)
+
+        # ---- 4. Pose estimation (players only, exclude refs) ------------------
+        ref_boxes = [d["box"] for d in ref_dets]
         pose_res = pose_model.predict(
             frame, verbose=False, device=device,
             conf=0.20, imgsz=infer_imgsz, half=use_half,
         )[0]
-        pose_map = associate_poses(real_dets, ghost_dets, pose_res)
+        pose_map = associate_poses(real_dets, ref_boxes, pose_res)
 
-        # ---- 4. Draw ball / hoop / ref ---------------------------------------
-        for det in ball_hoop_dets:
-            if det["cls"] == CUSTOM_CLS_BALL:
-                draw_ball(frame, det["box"])
-            elif det["cls"] == CUSTOM_CLS_HOOP:
-                draw_hoop(frame, det["box"])
-            elif det["cls"] == CUSTOM_CLS_REF:
-                draw_ref(frame, det["box"], det["tid"])
+        # ---- 5. Ball tracking + Re-ID (keep ball ID stable across occlusions) -
+        ball_dets    = ball_reid.update(frame_idx, ball_dets)
+        ball_to_draw = ball_tracker.update(frame_idx, ball_dets)
 
-        # ---- 5. Draw real players + skeletons --------------------------------
+        # ---- 6. Draw ball / hoop / ref ---------------------------------------
+        for det in ball_to_draw:
+            draw_ball(frame, det["box"])
+
+        for det in hoop_dets:
+            draw_hoop(frame, det["box"])
+
+        for det in ref_dets:
+            draw_ref(frame, det["box"], det["tid"])
+
+        # ---- 7. Draw real players + skeletons --------------------------------
         for d in real_dets:
             tid = d["tid"]
-            draw_player(frame, d["box"], f"#{tid}")
+            jersey = jersey_ocr.get_jersey(tid)
+            label = f"#{jersey}" if jersey else f"#{tid}"
+            draw_player(frame, d["box"], label)
             if tid in pose_map:
                 draw_skeleton(frame, *pose_map[tid])
 
-        # ---- 6. Ghost players ------------------------------------------------
-        for d in ghost_dets:
-            tid = d["tid"]
-            draw_player(frame, d["box"], f"#{tid}",
-                        ghost=True, age=d["age"], max_age=ghost_max_age)
-            if tid in pose_map:
-                draw_skeleton(frame, *pose_map[tid])
-
-        # ---- Write frame -----------------------------------------------------
         out_video.write(frame)
         frame_idx += 1
 
         t_frame = time.perf_counter() - t_frame_start
         if frame_idx <= 5 or frame_idx % 30 == 0:
+            n_jerseys = sum(1 for d in real_dets if jersey_ocr.get_jersey(d["tid"]))
             print(f"  frame {frame_idx}/{total_frames}  "
                   f"| {t_frame:.2f}s/frame  "
-                  f"| players={len(real_dets)}  ghost={len(ghost_dets)}  "
-                  f"| poses={len(pose_map)}")
+                  f"| players={len(real_dets)}  "
+                  f"| jerseys={n_jerseys}  "
+                  f"| poses={len(pose_map)}  "
+                  f"| ball={'YES' if ball_to_draw else 'no'}")
 
     cap.release()
     out_video.release()
-
     print(f"\nDone — {frame_idx} frames processed.")
     print(f"  Annotated video : {Path(out_dir) / 'annotated.mp4'}")
+    print(f"  Jersey numbers found: {dict(jersey_ocr._confirmed)}")
 
 
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="UVA MBB CV Pipeline")
-    parser.add_argument("--video", default="data/game_01test.mp4")
-    parser.add_argument("--out",   default="output")
-    parser.add_argument("--custom-model", default=None,
-                        help="Path to fine-tuned YOLO weights (replaces YOLO11s + YOLOE)")
+    parser.add_argument("--video",    default="data/game_01test.mp4")
+    parser.add_argument("--out",      default="output")
+    parser.add_argument("--weights",  default=None,
+                        help="Fine-tuned weights path "
+                             "(default: runs/detect/train/weights/best.pt)")
     parser.add_argument("--finetune", action="store_true",
-                        help="Fine-tune YOLO11s on data/custom_annotations/ dataset")
-    parser.add_argument("--epochs", type=int, default=50,
-                        help="Number of training epochs (for --finetune)")
-    parser.add_argument("--batch", type=int, default=8,
-                        help="Batch size (for --finetune)")
+                        help="Train on data/custom_annotations/ then run inference")
+    parser.add_argument("--epochs",   type=int, default=300)
+    parser.add_argument("--batch",    type=int, default=16)
+    parser.add_argument("--no-sahi",  action="store_true",
+                        help="Disable SAHI sliced inference for ball detection")
     args = parser.parse_args()
 
     if args.finetune:
         best_pt = finetune(epochs=args.epochs, batch=args.batch)
-        run(args.video, args.out, custom_model=best_pt)
+        run(args.video, args.out, weights=best_pt, use_sahi=not args.no_sahi)
     else:
-        run(args.video, args.out, custom_model=args.custom_model)
+        run(args.video, args.out, weights=args.weights, use_sahi=not args.no_sahi)
