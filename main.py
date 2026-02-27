@@ -69,15 +69,29 @@ VEL_HISTORY_LEN    = 15
 VEL_EXIT_THRESH    = 80
 
 # SAHI — targeted inference around ball's last known position
-SAHI_CROP_PAD      = 250    # pixels to pad around last known ball center for SAHI crop
+SAHI_CROP_PAD      = 400    # pixels to pad around last known ball center for SAHI crop
 SAHI_CONF_THRESH   = 0.10   # lower conf OK — we're zooming into a small region
-SAHI_SLICE_SIZE    = 160    # slice size within the cropped region
-SAHI_OVERLAP_RATIO = 0.25   # overlap between slices within the crop
+SAHI_SLICE_SIZE    = 128    # smaller slices = more zoom on small ball
+SAHI_OVERLAP_RATIO = 0.35   # more overlap = less chance ball splits across slice edges
 SAHI_MAX_LOST      = 60     # max frames since last ball sighting to run targeted SAHI
+
+# COCO pretrained ball detection — secondary detector for sports ball (class 32)
+COCO_BALL_CLS      = 32     # "sports ball" in COCO
+COCO_BALL_CONF     = 0.15   # confidence threshold for COCO ball detections
 
 # Jersey OCR
 OCR_INTERVAL       = 30     # run OCR every N frames (performance vs accuracy)
 OCR_CONFIRM_COUNT  = 2      # need this many consistent reads to lock a jersey number
+
+# Ball validation — reject false positives (bald heads, off-court objects)
+BALL_COURT_X_PAD     = 0.05    # horizontal slack beyond court edges (fraction of frame_w)
+BALL_MAX_BBOX_AREA   = 2500    # max ball bbox area in pixels (at 1080p) — rejects bald heads
+BALL_MIN_BBOX_AREA   = 50      # min ball bbox area — rejects noise
+BALL_MAX_TELEPORT_PX = 450     # max pixels ball can move per frame (at 1080p, 60fps)
+BALL_TELEPORT_GRACE  = 10      # frames since last sighting before teleport check resets
+
+# Ball trail
+BALL_TRAIL_MAX       = 30      # max trail points stored
 
 
 _G = (0, 255, 0)
@@ -327,16 +341,19 @@ class JerseyOCR:
 # ---------------------------------------------------------------------------
 
 class BallTracker:
-    """Track ball detections — pick best detection per frame, no interpolation.
-    Stores last known position so SAHI can target that region."""
+    """Track ball detections — pick best detection per frame, use velocity
+    detection-only mode — only draws when actually detected.
+    Stores last known position so SAHI can target that region.
+    Maintains a trail of recent positions for drawing."""
 
     def __init__(self):
         self._last_box: list | None = None
         self._last_seen_frame: int = -999
+        self._trail: deque = deque(maxlen=BALL_TRAIL_MAX)
+        self._frames_since: int = 0
 
     @property
     def last_center(self) -> tuple | None:
-        """Return (cx, cy) of last known ball position, or None."""
         if self._last_box is None:
             return None
         b = self._last_box
@@ -346,15 +363,22 @@ class BallTracker:
     def frames_since_seen(self) -> int:
         return self._frames_since
 
+    @property
+    def trail(self) -> list:
+        return list(self._trail)
+
     def update(self, frame_idx: int, ball_dets: list) -> list:
-        """Return only real ball detections (no predictions)."""
+        """Return ball detection to draw. No prediction — only real detections."""
         self._frames_since = frame_idx - self._last_seen_frame
         if not ball_dets:
             return []
-        # Pick largest detection (most likely the real ball, not noise)
-        best = max(ball_dets, key=lambda d: (d["box"][2]-d["box"][0]) * (d["box"][3]-d["box"][1]))
+        best = max(ball_dets, key=lambda d:
+                   (d["box"][2]-d["box"][0]) * (d["box"][3]-d["box"][1]))
         self._last_box = best["box"]
         self._last_seen_frame = frame_idx
+        cx = (best["box"][0] + best["box"][2]) / 2.0
+        cy = (best["box"][1] + best["box"][3]) / 2.0
+        self._trail.append((cx, cy))
         return [best]
 
 
@@ -408,6 +432,76 @@ class BallReID:
 
 
 # ---------------------------------------------------------------------------
+# Ball Validator — reject false positives (bald heads, off-court, teleports)
+# ---------------------------------------------------------------------------
+
+class BallValidator:
+    """Validate ball detections: court boundary, teleport rejection, size sanity."""
+
+    def __init__(self, roi_poly: np.ndarray, frame_w: int, frame_h: int):
+        self._roi_poly = roi_poly
+        self._frame_w = frame_w
+        self._frame_h = frame_h
+        self._last_center: tuple | None = None
+        self._last_frame: int = -999
+        # Scale thresholds to resolution (constants are for 1080p)
+        scale = (frame_w * frame_h) / (1920 * 1080)
+        self._max_area = BALL_MAX_BBOX_AREA * scale
+        self._min_area = BALL_MIN_BBOX_AREA * scale
+        self._max_teleport = BALL_MAX_TELEPORT_PX * (frame_w / 1920.0)
+
+    def filter(self, frame_idx: int, ball_dets: list,
+               hoop_dets: list) -> list:
+        """Return only plausible ball detections."""
+        valid = []
+        for d in ball_dets:
+            box = d["box"]
+            cx = (box[0] + box[2]) / 2.0
+            cy = (box[1] + box[3]) / 2.0
+            area = (box[2] - box[0]) * (box[3] - box[1])
+
+            # --- Check 1: Size sanity ---
+            near_hoop = self._near_any_hoop(cx, cy, hoop_dets)
+            max_area = self._max_area * (1.5 if near_hoop else 1.0)
+            if area > max_area or area < self._min_area:
+                continue
+
+            # --- Check 2: Court column ---
+            if not ball_in_court_region(self._roi_poly, cx, cy, self._frame_w):
+                continue
+
+            # --- Check 3: Teleport rejection ---
+            if self._last_center is not None:
+                gap = frame_idx - self._last_frame
+                if 0 < gap <= BALL_TELEPORT_GRACE:
+                    dist = math.hypot(cx - self._last_center[0],
+                                      cy - self._last_center[1])
+                    if dist > self._max_teleport * gap:
+                        continue
+
+            valid.append(d)
+
+        # Update history with the best valid detection
+        if valid:
+            best = max(valid, key=lambda d: (d["box"][2] - d["box"][0]) *
+                                             (d["box"][3] - d["box"][1]))
+            self._last_center = ((best["box"][0] + best["box"][2]) / 2.0,
+                                 (best["box"][1] + best["box"][3]) / 2.0)
+            self._last_frame = frame_idx
+
+        return valid
+
+    def _near_any_hoop(self, cx: float, cy: float, hoop_dets: list) -> bool:
+        margin = self._frame_w * 0.08
+        for h in hoop_dets:
+            hcx = (h["box"][0] + h["box"][2]) / 2.0
+            hcy = (h["box"][1] + h["box"][3]) / 2.0
+            if abs(cx - hcx) < margin and abs(cy - hcy) < margin:
+                return True
+        return False
+
+
+# ---------------------------------------------------------------------------
 # SAHI — targeted inference around ball's last known position
 # ---------------------------------------------------------------------------
 
@@ -448,7 +542,7 @@ def run_sahi_ball_targeted(
 
     sahi_balls: list = []
     for pred in result.object_prediction_list:
-        if int(pred.category.id) != CLS_BALL:
+        if int(pred.category.id) != COCO_BALL_CLS:
             continue
         if pred.score.value < SAHI_CONF_THRESH:
             continue
@@ -486,6 +580,45 @@ def in_court_roi(roi_poly: np.ndarray, box: list) -> bool:
     foot_x = (box[0] + box[2]) / 2.0
     foot_y = float(box[3])
     return cv2.pointPolygonTest(roi_poly, (foot_x, foot_y), False) >= 0
+
+
+def ball_in_court_region(roi_poly: np.ndarray, cx: float, cy: float,
+                         frame_w: int) -> bool:
+    """Check if ball is within the court or above it (airborne).
+
+    Rules:
+      - Ball BELOW the court bottom edge → reject (crowd/bench area)
+      - Ball WITHIN or ABOVE the court → accept if x is within court column
+      - Small vertical slack below bottom edge for balls near the baseline
+
+    The court ROI trapezoid has 4 points:
+      [0] bottom-left, [1] bottom-right, [2] top-right, [3] top-left
+    """
+    pts = roi_poly.reshape(-1, 2).astype(np.float64)
+    bl, br, tr, tl = pts[0], pts[1], pts[2], pts[3]
+
+    top_y = min(tl[1], tr[1])
+    bot_y = max(bl[1], br[1])
+    pad_x = frame_w * BALL_COURT_X_PAD
+    # Small vertical slack below the baseline (ball can bounce near edge)
+    pad_y = (bot_y - top_y) * 0.05
+
+    # Reject anything below the court bottom + slack (crowd/bench)
+    if cy > bot_y + pad_y:
+        return False
+
+    # For ball within or above the court, check x is in the court column
+    if cy <= top_y:
+        # Above the court — use top edge x-span
+        left_x  = tl[0] - pad_x
+        right_x = tr[0] + pad_x
+    else:
+        # Within the court trapezoid — interpolate left/right edges
+        t = (cy - top_y) / (bot_y - top_y)
+        left_x  = tl[0] + t * (bl[0] - tl[0]) - pad_x
+        right_x = tr[0] + t * (br[0] - tr[0]) + pad_x
+
+    return left_x <= cx <= right_x
 
 
 # ---------------------------------------------------------------------------
@@ -578,10 +711,64 @@ def associate_poses(real_dets: list, ref_boxes: list, pose_result) -> dict:
     return associations
 
 
-def draw_ball(frame, box, label="BASKETBALL"):
+def draw_ball(frame, box, label="BALL"):
     x1, y1, x2, y2 = map(int, box)
-    cv2.rectangle(frame, (x1, y1), (x2, y2), C_BALL, 3, cv2.LINE_AA)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), C_BALL, 2, cv2.LINE_AA)
     _label_bg(frame, x1, y1 - 3, label, C_BALL)
+
+
+def draw_ball_trail(frame, trail: list, ball_box: list | None = None):
+    """Draw comet trail of shrinking ball ellipses behind the ball.
+    Each ghost is a smaller, more transparent copy of the ball shape."""
+    n = len(trail)
+    if n < 2 or ball_box is None:
+        return
+
+    bw = ball_box[2] - ball_box[0]
+    bh = ball_box[3] - ball_box[1]
+    ball_rx = max(1, bw // 2)
+    ball_ry = max(1, bh // 2)
+    max_trail_len = max(bw, bh) * 2.0
+
+    # Build trail points with cumulative distance from head, capped at max_trail_len
+    points = []  # (cx, cy, cumulative_dist)
+    cumulative = 0.0
+    for i in range(n - 1, 0, -1):
+        dx = trail[i][0] - trail[i - 1][0]
+        dy = trail[i][1] - trail[i - 1][1]
+        seg_len = math.hypot(dx, dy)
+        if cumulative + seg_len > max_trail_len:
+            break
+        cumulative += seg_len
+        points.append((trail[i - 1][0], trail[i - 1][1], cumulative))
+
+    if not points:
+        return
+    total_len = points[-1][2]
+    if total_len < 1:
+        return
+
+    # Draw tail-first so closer ghosts render on top
+    overlay = frame.copy()
+    for (cx, cy, cum_dist) in reversed(points):
+        # t = 0 at head, 1 at tail
+        t = cum_dist / total_len
+        # Quadratic falloff — shrinks and fades fast
+        alpha = (1.0 - t) ** 2
+        if alpha < 0.03:
+            continue
+        # Shrink ellipse radii: full size at head → tiny at tail (min 2px)
+        rx = max(2, int(ball_rx * (1.0 - t * 0.8)))
+        ry = max(2, int(ball_ry * (1.0 - t * 0.8)))
+        # Color fades from bright red to dark
+        r = int(255 * alpha)
+        g = int(40 * alpha)
+        color = (0, g, r)
+        icx, icy = int(cx), int(cy)
+        cv2.ellipse(overlay, (icx, icy), (rx, ry), 0, 0, 360, color, -1)
+
+    # Blend the trail overlay onto the frame
+    cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
 
 
 def draw_hoop(frame, box):
@@ -701,19 +888,22 @@ def finetune(epochs: int = 200, batch: int = 8, imgsz: int = 960):
         # Regularization
         dropout=0.10,          # less dropout needed with more data
         weight_decay=0.0005,   # L2 regularization
-        # Augmentation — moderate, ~1,200 train images is a reasonable dataset
-        hsv_h=0.015, hsv_s=0.5, hsv_v=0.3,
-        degrees=5.0,           # slight rotation — court camera is fairly stable
-        translate=0.15,
+        # Augmentation — moderate color jitter to preserve orange=ball vs skin=head,
+        # but enough variation for lighting/shadow robustness.
+        hsv_h=0.02,            # slight hue shift — keep orange distinguishable from skin
+        hsv_s=0.5,             # moderate saturation — preserve color info
+        hsv_v=0.4,             # brightness jitter — handles shadows, glare
+        degrees=10.0,          # slight rotation — preserve court spatial context
+        translate=0.2,
         scale=0.5,             # moderate scale variation
-        shear=1.0,
-        perspective=0.0003,
-        flipud=0.0,
+        shear=2.0,
+        perspective=0.0005,
+        flipud=0.0,            # no vertical flip — preserves court=bottom, crowd=top
         fliplr=0.5,
-        mosaic=1.0,            # combine 4 images — still useful for occlusion
-        mixup=0.15,            # lighter blending — enough data for real examples
-        copy_paste=0.2,        # paste objects for synthetic occlusion
-        erasing=0.3,           # random erase for occlusion robustness
+        mosaic=1.0,            # combine 4 images — occlusion + context variety
+        mixup=0.15,            # light blending
+        copy_paste=0.3,        # paste objects — synthetic occlusion
+        erasing=0.4,           # random erase — partial occlusion robustness
         crop_fraction=1.0,
         # Early stopping — 242 val images = smooth metrics, can stop sooner
         patience=30,
@@ -770,13 +960,17 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
     print("Loading YOLO11n-pose (skeleton estimation) ...")
     pose_model = YOLO("yolo11n-pose.pt")
 
-    # SAHI — sliced inference for small ball detection
+    # COCO pretrained model — secondary ball detector using "sports ball" class
+    print("Loading COCO pretrained model (sports ball fallback) ...")
+    coco_model = YOLO("yolo11s.pt")
+
+    # SAHI — sliced inference using COCO model for better ball detection
     sahi_model = None
     if use_sahi:
-        print("Loading SAHI sliced-inference model (ball detection) ...")
+        print("Loading SAHI sliced-inference model (COCO sports ball) ...")
         sahi_model = AutoDetectionModel.from_pretrained(
             model_type="yolov8",          # compatible with YOLO11
-            model_path=weights_path,
+            model_path="yolo11s.pt",      # COCO pretrained — strong sports ball class
             confidence_threshold=SAHI_CONF_THRESH,
             device=device,
         )
@@ -792,6 +986,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
     jersey_ocr    = JerseyOCR()
     ball_tracker  = BallTracker()
     ball_reid     = BallReID()
+    ball_validator = BallValidator(roi_poly, frame_w, frame_h)
 
     fourcc    = cv2.VideoWriter_fourcc(*"mp4v")
     out_video = cv2.VideoWriter(
@@ -839,6 +1034,8 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                         continue
                     raw_dets.append({"tid": tid, "box": box_list, "label": LABEL_PLAYER})
                 elif cls_id == CLS_BALL:
+                    if conf_val < 0.20:
+                        continue
                     ball_dets.append({"tid": tid, "box": box_list, "cls": CLS_BALL})
                 elif cls_id == CLS_HOOP:
                     if conf_val >= 0.30:
@@ -847,13 +1044,66 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                     if conf_val >= 0.30:
                         ref_dets.append({"tid": tid, "box": box_list, "cls": CLS_REF})
 
+        # ---- 1a. COCO pretrained "sports ball" fallback -------------------------
+        # Run COCO model for sports ball class only — supplements fine-tuned dets.
+        coco_res = coco_model.predict(
+            frame, conf=COCO_BALL_CONF, classes=[COCO_BALL_CLS],
+            imgsz=infer_imgsz, device=device, half=use_half,
+            verbose=False,
+        )[0]
+        if coco_res.boxes is not None and len(coco_res.boxes):
+            for box, conf in zip(coco_res.boxes.xyxy, coco_res.boxes.conf):
+                cbox = list(map(int, box.tolist()))
+                # Avoid duplicates: skip if a fine-tuned ball det already overlaps
+                duplicate = False
+                for bd in ball_dets:
+                    ix1 = max(cbox[0], bd["box"][0])
+                    iy1 = max(cbox[1], bd["box"][1])
+                    ix2 = min(cbox[2], bd["box"][2])
+                    iy2 = min(cbox[3], bd["box"][3])
+                    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                    area_c = (cbox[2]-cbox[0]) * (cbox[3]-cbox[1])
+                    area_b = (bd["box"][2]-bd["box"][0]) * (bd["box"][3]-bd["box"][1])
+                    union = area_c + area_b - inter
+                    if union > 0 and inter / union > 0.3:
+                        duplicate = True
+                        break
+                if not duplicate:
+                    ball_dets.append({"tid": -1, "box": cbox, "cls": CLS_BALL})
+
         # ---- 1b. SAHI targeted detection around last known ball position ------
-        if sahi_model is not None and not ball_dets:
+        # Runs every frame (not just when ball is lost) — zoomed-in COCO model
+        # gives the most reliable ball detection once we know the region.
+        if sahi_model is not None:
             center = ball_tracker.last_center
             if center is not None and ball_tracker.frames_since_seen < SAHI_MAX_LOST:
                 sahi_balls = run_sahi_ball_targeted(
                     sahi_model, frame, center, ball_dets)
                 ball_dets.extend(sahi_balls)
+            elif center is None or ball_tracker.frames_since_seen >= SAHI_MAX_LOST:
+                # No prior position or ball lost too long — run full-frame SAHI
+                # every 10 frames to re-acquire without killing performance
+                if frame_idx % 10 == 0:
+                    result = get_sliced_prediction(
+                        image=frame,
+                        detection_model=sahi_model,
+                        slice_height=320,
+                        slice_width=320,
+                        overlap_height_ratio=0.25,
+                        overlap_width_ratio=0.25,
+                        postprocess_type="NMS",
+                        postprocess_match_threshold=0.40,
+                        verbose=0,
+                    )
+                    for pred in result.object_prediction_list:
+                        if int(pred.category.id) != COCO_BALL_CLS:
+                            continue
+                        if pred.score.value < SAHI_CONF_THRESH:
+                            continue
+                        bb = pred.bbox
+                        box = [int(bb.minx), int(bb.miny),
+                               int(bb.maxx), int(bb.maxy)]
+                        ball_dets.append({"tid": -1, "box": box, "cls": CLS_BALL})
 
         # ---- 2. Re-ID + memory + velocity ------------------------------------
         raw_dets              = reid_buffer.update(frame_idx, raw_dets)
@@ -880,11 +1130,14 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         )[0]
         pose_map = associate_poses(real_dets, ref_boxes, pose_res)
 
-        # ---- 5. Ball tracking + Re-ID (keep ball ID stable across occlusions) -
+        # ---- 5. Ball validation + tracking + Re-ID ----------------------------
+        ball_dets    = ball_validator.filter(frame_idx, ball_dets, hoop_dets)
         ball_dets    = ball_reid.update(frame_idx, ball_dets)
         ball_to_draw = ball_tracker.update(frame_idx, ball_dets)
 
         # ---- 6. Draw ball / hoop / ref ---------------------------------------
+        ball_box_for_trail = ball_to_draw[0]["box"] if ball_to_draw else None
+        draw_ball_trail(frame, ball_tracker.trail, ball_box_for_trail)
         for det in ball_to_draw:
             draw_ball(frame, det["box"])
 
