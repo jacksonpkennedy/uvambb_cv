@@ -13,6 +13,7 @@ Dataset (data/custom_annotations/data.yaml):
 import argparse
 import math
 import re
+import shutil
 import time
 from collections import deque
 from pathlib import Path
@@ -601,7 +602,58 @@ def draw_ref(frame, box, tid: int):
 # Fine-tuning
 # ---------------------------------------------------------------------------
 
-def finetune(epochs: int = 300, batch: int = 8, imgsz: int = 960):
+def _oversample_class(data_dir: Path, cls_id: int, cls_name: str, factor: int = 3):
+    """Duplicate images containing a specific class to balance the dataset.
+    Copies both image and label files with a unique suffix.
+    Skips if oversampled copies already exist."""
+    train_imgs  = data_dir / "train" / "images"
+    train_lbls  = data_dir / "train" / "labels"
+    if not train_imgs.exists() or not train_lbls.exists():
+        return 0
+
+    copied = 0
+    for lbl_path in train_lbls.glob("*.txt"):
+        # Check if this label file contains the target class
+        text = lbl_path.read_text()
+        has_cls = any(
+            line.strip().startswith(f"{cls_id} ")
+            for line in text.splitlines()
+            if line.strip()
+        )
+        if not has_cls:
+            continue
+
+        stem = lbl_path.stem
+        # Skip files that are already oversampled copies
+        if f"_os{cls_name}" in stem:
+            continue
+
+        # Find matching image (try common extensions)
+        img_path = None
+        for ext in (".jpg", ".jpeg", ".png", ".bmp"):
+            candidate = train_imgs / f"{stem}{ext}"
+            if candidate.exists():
+                img_path = candidate
+                break
+        if img_path is None:
+            continue
+
+        # Check if copies already exist from a previous run
+        first_copy_lbl = train_lbls / f"{stem}_os{cls_name}_1.txt"
+        if first_copy_lbl.exists():
+            continue
+
+        # Create N-1 extra copies (original + copies = factor total)
+        for k in range(1, factor):
+            new_stem = f"{stem}_os{cls_name}_{k}"
+            shutil.copy2(img_path, train_imgs / f"{new_stem}{img_path.suffix}")
+            shutil.copy2(lbl_path, train_lbls / f"{new_stem}.txt")
+            copied += 1
+
+    return copied
+
+
+def finetune(epochs: int = 200, batch: int = 8, imgsz: int = 960):
     base_dir  = Path(__file__).resolve().parent
     data_yaml = str(base_dir / "data" / "custom_annotations" / "data.yaml")
 
@@ -611,6 +663,17 @@ def finetune(epochs: int = 300, batch: int = 8, imgsz: int = 960):
             "Export your Roboflow dataset (YOLO format) to data/custom_annotations/\n"
             "data.yaml must define: nc=4, names=[basketball, hoop, players, referee]"
         )
+
+    # Oversample basketball class — it's small and rare in frames,
+    # so the model under-learns it compared to players/refs.
+    data_dir = base_dir / "data" / "custom_annotations"
+    # basketball=159, hoop=596, player=8032, referee=2174 annotations
+    # factor=8 → basketball appears 8x → ~1,272 annotations (closer to hoop/ref)
+    n = _oversample_class(data_dir, CLS_BALL, "ball", factor=8)
+    if n:
+        print(f"Oversampled basketball: +{n} copies added to training set")
+    else:
+        print("Basketball oversampling: already done or no ball annotations found")
 
     device = get_device()
     print(f"Fine-tuning YOLO11s  |  epochs={epochs}  batch={batch}  "
@@ -634,26 +697,26 @@ def finetune(epochs: int = 300, batch: int = 8, imgsz: int = 960):
         # Learning rate
         lr0=0.001,
         lrf=0.01,              # final LR = lr0 * lrf
-        warmup_epochs=10,      # longer warmup for small dataset stability
-        # Regularization — dropout to prevent overfitting on small dataset
-        dropout=0.15,          # randomly drop 15% of features during training
+        warmup_epochs=5,       # ~1,200 images — converges faster, shorter warmup OK
+        # Regularization
+        dropout=0.10,          # less dropout needed with more data
         weight_decay=0.0005,   # L2 regularization
-        # Augmentation — aggressive to compensate for only ~200 images
-        hsv_h=0.02, hsv_s=0.7, hsv_v=0.4,
-        degrees=10.0,          # rotation — camera angles vary
-        translate=0.2,         # shift images to simulate different framing
-        scale=0.7,             # aggressive scale variation
-        shear=2.0,             # slight shear for perspective variation
-        perspective=0.0005,    # perspective warp — simulates camera angle changes
+        # Augmentation — moderate, ~1,200 train images is a reasonable dataset
+        hsv_h=0.015, hsv_s=0.5, hsv_v=0.3,
+        degrees=5.0,           # slight rotation — court camera is fairly stable
+        translate=0.15,
+        scale=0.5,             # moderate scale variation
+        shear=1.0,
+        perspective=0.0003,
         flipud=0.0,
         fliplr=0.5,
-        mosaic=1.0,            # combine 4 images — creates partial occlusions
-        mixup=0.3,             # blend images — teaches model to see through overlap
-        copy_paste=0.3,        # paste objects onto other backgrounds — synthetic occlusion
-        erasing=0.4,           # randomly erase patches — forces robustness to occlusion
-        crop_fraction=1.0,     # random crop during classification (full image)
-        # Early stopping — patient, small datasets are noisy
-        patience=50,
+        mosaic=1.0,            # combine 4 images — still useful for occlusion
+        mixup=0.15,            # lighter blending — enough data for real examples
+        copy_paste=0.2,        # paste objects for synthetic occlusion
+        erasing=0.3,           # random erase for occlusion robustness
+        crop_fraction=1.0,
+        # Early stopping — 242 val images = smooth metrics, can stop sooner
+        patience=30,
     )
 
     best_pt = base_dir / "runs" / "detect" / "train" / "weights" / "best.pt"
@@ -864,14 +927,14 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="UVA MBB CV Pipeline")
-    parser.add_argument("--video",    default="data/game_01test.mp4")
+    parser.add_argument("--video",    default="data/game_02test.mp4")
     parser.add_argument("--out",      default="output")
     parser.add_argument("--weights",  default=None,
                         help="Fine-tuned weights path "
                              "(default: runs/detect/train/weights/best.pt)")
     parser.add_argument("--finetune", action="store_true",
                         help="Train on data/custom_annotations/ then run inference")
-    parser.add_argument("--epochs",   type=int, default=300)
+    parser.add_argument("--epochs",   type=int, default=200)
     parser.add_argument("--batch",    type=int, default=16)
     parser.add_argument("--no-sahi",  action="store_true",
                         help="Disable SAHI sliced inference for ball detection")

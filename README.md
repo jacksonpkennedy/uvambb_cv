@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-This project builds a full basketball analysis pipeline on top of YOLOE-26 to automatically convert raw game footage into actionable play data. The system moves through four phases — detection, spatial mapping, event recognition, and play classification — turning raw pixels into a structured play log and box score.
+A basketball analysis pipeline that detects, tracks, and annotates players, referees, the basketball, and the hoop from game footage using a fine-tuned YOLO11s model with ByteTrack multi-object tracking, pose estimation, jersey number OCR, and SAHI-enhanced ball detection.
 
 **Team Members:**
 - Jackson Kennedy
@@ -13,101 +13,25 @@ This project builds a full basketball analysis pipeline on top of YOLOE-26 to au
 
 ## Pipeline Architecture
 
-### Phase 1 — Detection & Tracking (Vision Layer)
-
-Converts raw video frames into timestamped x,y coordinate streams for every tracked object.
-
-| Component | Choice | Rationale |
+| Component | Implementation | Details |
 |---|---|---|
-| Base Model | YOLOE-26 (open-vocabulary) | NMS-free inference, STAL for small-object (ball) detection, up to 43% faster on CPU than prior versions |
-| Text Prompts | `"basketball"`, `"player"`, `"hoop"`, `"referee"` | Open-vocabulary head — no custom class retraining needed |
-| Tracker | ByteTrack or BoT-SORT | High-FPS re-association prevents ball ID loss during fast passes |
-| Pose Head | YOLOE-26-Pose (joint keypoints) | Distinguishes shots from passes via elbow/knee extension angles |
+| Detection | YOLO11s (fine-tuned) | 4 classes: basketball, hoop, player, referee |
+| Tracking | ByteTrack | Custom config tuned for basketball — 4s track buffer, low thresholds for ball |
+| Pose Estimation | YOLO11n-pose | 17-point COCO skeleton, players only (excludes referees) |
+| Jersey OCR | EasyOCR | Reads jersey numbers from torso crops, confirms after 2 consistent reads |
+| Ball Recovery | SAHI (targeted) | Sliced inference around ball's last known position when tracker loses it |
+| Ball Re-ID | Custom | Keeps ball track ID stable across occlusions (4s buffer, 500px radius) |
+| Player Re-ID | Custom | Re-associates lost player tracks (3s buffer, 300px radius) |
+| Velocity Tracker | Custom | Preserves player IDs through overlapping bounding boxes |
 
-**Output:** Per-frame bounding boxes + track IDs + 17-keypoint skeletons for all players and the ball.
+### Detection Classes
 
----
-
-### Phase 2 — Spatial Mapping (Homography)
-
-Camera perspective distorts all pixel coordinates. This phase warps them onto a canonical 2D top-down court.
-
-**Steps:**
-
-1. Run a secondary YOLOE-26-Pose model trained on court keypoints (baseline corners, sideline corners, 3-point arc endpoints).
-2. Solve for a 3×3 Homography Matrix **H** using the detected court keypoints and their known real-world positions.
-3. Apply the transform to every tracked object every frame:
-
-```
-[x, y, 1]ᵀ = H · [u, v, 1]ᵀ
-```
-
-**Output:** True court coordinates (feet or meters) for every player and the ball — enabling real distances, speeds, and spacing calculations.
-
----
-
-### Phase 3 — Event Recognition (Logic Layer)
-
-Spatio-temporal triggers convert coordinate streams into discrete basketball events.
-
-| Event | Trigger Logic |
-|---|---|
-| **Shot** | Player pose shows arm extension + ball trajectory follows a parabolic arc toward the hoop zone |
-| **Rebound** | Ball enters hoop zone → trajectory reverses → ball enters a player bounding box |
-| **Pass** | Ball leaves Player A bounding box at high velocity → enters Player B bounding box |
-| **Screen / Pick** | Player stops within 1–2 ft of a teammate for ≥ 1 second while a third player drives |
-| **Crash / Contact** | Two or more player boxes have IoU > 0.5 with high relative velocity |
-| **Out of Bounds** | Ball court coordinates exit court boundary polygon |
-
-**Output:** Timestamped event log — e.g., `[t=14.3s, PASS, player_id=5 → player_id=11]`.
-
----
-
-### Phase 4 — Play Classification (Analyze Layer)
-
-Sequences of events are fed into a temporal model to classify full offensive/defensive plays.
-
-**Model options:**
-- **State Machine** — deterministic rules for common sets (Pick and Roll, DHO, etc.)
-- **Transformer** — learns play patterns from labeled sequence data
-
-**Example rule (Pick and Roll):**
-```
-IF player[PG] holds position at top
-AND player[C] moves toward player[PG] and stops (Screen event)
-AND player[PG] drives baseline or presses mid-range
-THEN classify → PICK AND ROLL
-```
-
-**Output:** Structured JSON play log + box score CSV.
-
-```json
-{
-  "play_id": 42,
-  "type": "Pick and Roll",
-  "ball_handler": 5,
-  "screener": 33,
-  "outcome": "Layup (Made)",
-  "timestamp_start": "Q2 08:14",
-  "timestamp_end": "Q2 08:09"
-}
-```
-
----
-
-## Technical Stack
-
-| Layer | Tools |
-|---|---|
-| Detection & Pose | YOLOE-26, YOLOE-26-Pose (Ultralytics) |
-| Tracking | ByteTrack / BoT-SORT |
-| Homography | OpenCV `findHomography`, `perspectiveTransform` |
-| Event Logic | Custom rule engine (Python) |
-| Play Classification | PyTorch Transformer or `scikit-learn` state machine |
-| Data Processing | NumPy, Pandas |
-| Video I/O | OpenCV, FFmpeg |
-| Visualization | OpenCV, Matplotlib |
-| Language | Python 3.10+ |
+| ID | Class | Color (BGR) | Notes |
+|---|---|---|---|
+| 0 | basketball | Red (0,0,255) | Oversampled 8x during training |
+| 1 | hoop | White (255,255,255) | Cross-hair marker at center |
+| 2 | player | Green (0,255,0) | Pose skeleton + jersey OCR |
+| 3 | referee | Dark Blue (180,60,20) | No pose estimation |
 
 ---
 
@@ -115,68 +39,118 @@ THEN classify → PICK AND ROLL
 
 ```
 uvambb_cv/
-├── README.md
-├── src/
-│   ├── detection/           # YOLOE-26 inference + ByteTrack integration
-│   ├── homography/          # Court keypoint detection + H-matrix solving
-│   ├── events/              # Spatio-temporal event triggers
-│   ├── play_classifier/     # Temporal model for play classification
-│   ├── statistics/          # Box score and play log export
-│   └── utils/               # Shared helpers (video I/O, coordinate math)
-├── models/                  # Model weights (YOLOE-26, court keypoint model)
-├── data/                    # Sample game footage and labeled datasets
-├── notebooks/               # Exploratory analysis and prototyping
-└── tests/                   # Unit tests
+├── main.py                          # Full pipeline — fine-tuning + inference
+├── bytetrack_players.yaml           # ByteTrack tracker config
+├── data/
+│   ├── custom_annotations/          # Roboflow export (YOLOv11 format)
+│   │   ├── data.yaml                # Dataset config (nc=4, class names)
+│   │   ├── train/                   # 968 training images + labels
+│   │   │   ├── images/
+│   │   │   └── labels/
+│   │   └── val/                     # 242 validation images + labels
+│   │       ├── images/
+│   │       └── labels/
+│   ├── frames/                      # Extracted frames from game footage
+│   └── game_01.mp4                  # Game footage
+├── runs/detect/train/weights/       # Fine-tuned model weights
+│   ├── best.pt                      # Best val mAP checkpoint
+│   └── last.pt                      # Latest epoch checkpoint
+└── output/
+    └── annotated.mp4                # Annotated output video
 ```
 
 ---
 
 ## Installation & Setup
 
-**Requirements:** Python 3.10+, CUDA GPU recommended, FFmpeg
+**Requirements:** Python 3.10+, CUDA GPU recommended
 
 ```bash
-pip install ultralytics          # YOLOE-26 + YOLOE-26-Pose
-pip install opencv-python
-pip install numpy pandas matplotlib scikit-learn
-pip install torch torchvision
+conda activate personal
+
+pip install ultralytics        # YOLO11 detection + pose
+pip install opencv-python      # Video I/O + drawing
+pip install numpy torch        # Core dependencies
+pip install easyocr            # Jersey number recognition
+pip install sahi               # Sliced inference for small ball detection
 ```
 
 ---
 
 ## Usage
 
+### Fine-tune on your dataset
+
+```bash
+python main.py --finetune [--epochs 200] [--batch 8]
+```
+
+This will:
+1. Oversample basketball images 8x to balance class distribution
+2. Train YOLO11s with transfer learning from COCO weights
+3. Save best weights to `runs/detect/train/weights/best.pt`
+4. Early stopping with patience=30 (stops if val mAP plateaus)
+
+### Run inference
+
+```bash
+python main.py --video data/game_01.mp4 [--weights path/to/best.pt]
+```
+
+### Disable SAHI (faster, less ball detection)
+
+```bash
+python main.py --video data/game_01.mp4 --no-sahi
+```
+
+### Resume training from checkpoint
+
 ```python
-from src.detection import YOLOETracker
-from src.homography import CourtMapper
-from src.events import EventDetector
-from src.play_classifier import PlayClassifier
+from ultralytics import YOLO
+model = YOLO("runs/detect/train/weights/last.pt")
+model.train(resume=True)
+```
 
-# 1. Track players and ball
-tracker = YOLOETracker(prompts=["basketball", "player", "hoop", "referee"])
-tracks = tracker.process("game_video.mp4")
+---
 
-# 2. Map pixel coords to court coords
-mapper = CourtMapper()
-court_tracks = mapper.transform(tracks)
+## Training Configuration
 
-# 3. Detect events
-detector = EventDetector()
-events = detector.detect(court_tracks)
+| Parameter | Value | Rationale |
+|---|---|---|
+| Base model | yolo11s.pt | Small model, fast training, COCO pretrained |
+| Image size | 960 | Balance between detail and VRAM |
+| Batch size | 8 | Fits in GPU VRAM |
+| Gradient accum (nbs) | 64 | Effective batch=64 for smoother training |
+| Epochs | 200 (max) | Early stopping typically fires at 130-180 |
+| Patience | 30 | 242 val images = smooth metrics |
+| Learning rate | 0.001 → 0.00001 | Cosine decay (lrf=0.01) |
+| Dropout | 0.10 | Regularization for ~1,200 image dataset |
+| Basketball oversample | 8x | 159 → ~1,272 annotations |
 
-# 4. Classify plays and export
-classifier = PlayClassifier()
-plays = classifier.classify(events)
-plays.to_json("play_log.json")
+### Augmentation
+
+Mosaic, mixup (0.15), copy-paste (0.2), random erasing (0.3), HSV jitter, rotation (5 deg), translation, scale, shear, perspective warp, horizontal flip.
+
+---
+
+## ByteTrack Configuration
+
+```yaml
+track_high_thresh: 0.25    # Low to catch ball at low confidence
+track_low_thresh: 0.05     # Very low rescue threshold for ball during passes
+new_track_thresh: 0.35     # Low to pick up ball quickly
+track_buffer: 240           # 4 seconds at 60fps
+match_thresh: 0.70          # Loose for fast ball movement
 ```
 
 ---
 
 ## Known Limitations
 
-- Ball tracking degrades during pile-ups or off-screen moments
-- Homography accuracy depends on camera angle — fixed broadcast angles work best
-- Play classification quality scales with the size of the labeled play dataset
+- Ball tracking degrades during fast passes and heavy occlusion
+- Jersey OCR accuracy depends on camera resolution and player orientation
+- Court ROI polygon is hardcoded — needs adjustment for different camera angles
+- Pose estimation can occasionally snap to nearby referees despite filtering
 
 ---
 
