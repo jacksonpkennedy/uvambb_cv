@@ -1,0 +1,17 @@
+# ByteTrack settings — tuned for basketball player + object tracking
+# https://arxiv.org/abs/2110.06864
+
+tracker_type: bytetrack
+
+track_high_thresh: 0.25    # first-pass association — lower to catch ball at low conf
+track_low_thresh: 0.05     # second-pass (rescue) — very low to rescue ball during passes
+
+new_track_thresh: 0.35     # min confidence to spawn a new track (lower = catch ball sooner)
+
+# Keep lost tracks alive for 4 s at 60 fps before deleting.
+# Ball disappears during fast passes, players occlude each other.
+track_buffer: 240          # frames (240 ≈ 4 s at 60 fps)
+
+match_thresh: 0.70         # IoU threshold for data association (looser for fast ball movement)
+
+fuse_score: True
