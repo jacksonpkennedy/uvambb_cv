@@ -15,11 +15,12 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
 
 | Component | Implementation | Details |
 |---|---|---|
-| Detection | YOLO11s (fine-tuned) | 4 classes: basketball, hoop, player, referee |
+| Detection | YOLO11s (fine-tuned) + COCO pretrained | Fine-tuned model for players/hoop/ref, COCO "sports ball" (class 32) as secondary ball detector |
 | Tracking | ByteTrack | Custom config tuned for basketball — 4s track buffer, low thresholds for ball |
 | Pose Estimation | YOLO11n-pose | 17-point COCO skeleton, players only (excludes referees) |
 | Jersey OCR | EasyOCR | Reads jersey numbers from torso crops, confirms after 2 consistent reads |
-| Ball Recovery | SAHI (targeted) | Sliced inference around ball's last known position when tracker loses it |
+| Ball Recovery | SAHI (COCO model) | Targeted sliced inference around last known ball position every frame + full-frame scan to re-acquire |
+| Ball Validation | BallValidator | 3-layer filter: size sanity, court region check, teleport rejection |
 | Ball Re-ID | Custom | Keeps ball track ID stable across occlusions (4s buffer, 500px radius) |
 | Player Re-ID | Custom | Re-associates lost player tracks (3s buffer, 300px radius) |
 | Velocity Tracker | Custom | Preserves player IDs through overlapping bounding boxes |
@@ -28,7 +29,7 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
 
 | ID | Class | Color (BGR) | Notes |
 |---|---|---|---|
-| 0 | basketball | Red (0,0,255) | Oversampled 8x during training |
+| 0 | basketball | Red (0,0,255) | Oversampled 8x during training, dual-model detection (fine-tuned + COCO) |
 | 1 | hoop | White (255,255,255) | Cross-hair marker at center |
 | 2 | player | Green (0,255,0) | Pose skeleton + jersey OCR |
 | 3 | referee | Dark Blue (180,60,20) | No pose estimation |
@@ -44,10 +45,10 @@ uvambb_cv/
 ├── data/
 │   ├── custom_annotations/          # Roboflow export (YOLOv11 format)
 │   │   ├── data.yaml                # Dataset config (nc=4, class names)
-│   │   ├── train/                   # 968 training images + labels
+│   │   ├── train/                   # ~9,600 training images + labels (incl. oversampled)
 │   │   │   ├── images/
 │   │   │   └── labels/
-│   │   └── val/                     # 242 validation images + labels
+│   │   └── val/                     # 364 validation images + labels
 │   │       ├── images/
 │   │       └── labels/
 │   ├── frames/                      # Extracted frames from game footage
@@ -129,7 +130,7 @@ model.train(resume=True)
 
 ### Augmentation
 
-Mosaic, mixup (0.15), copy-paste (0.2), random erasing (0.3), HSV jitter, rotation (5 deg), translation, scale, shear, perspective warp, horizontal flip.
+Mosaic, mixup (0.15), copy-paste (0.3), random erasing (0.4), moderate HSV jitter (h=0.02, s=0.5, v=0.4), rotation (10 deg), translation, scale, shear, perspective warp, horizontal flip. Augmentation kept moderate to preserve color distinction between basketball (orange) and skin tones.
 
 ---
 
@@ -142,6 +143,20 @@ new_track_thresh: 0.35     # Low to pick up ball quickly
 track_buffer: 240           # 4 seconds at 60fps
 match_thresh: 0.70          # Loose for fast ball movement
 ```
+
+---
+
+## Ball Detection Pipeline
+
+The basketball is the hardest object to detect (small, fast-moving, similar to bald heads). The pipeline uses a multi-stage approach:
+
+1. **Fine-tuned model** — detects ball at conf ≥ 0.20 (low threshold, BallValidator catches false positives)
+2. **COCO pretrained model** — runs `yolo11s.pt` with "sports ball" class (32) at conf ≥ 0.15 as a secondary detector
+3. **SAHI targeted** — zoomed-in sliced inference (128px slices, 35% overlap) around last known ball position using COCO model every frame
+4. **SAHI full-frame** — when ball is lost, scans entire frame every 10th frame to re-acquire
+5. **BallValidator** — rejects false positives with size check (50-2500px² at 1080p), court region check, and teleport rejection (450px/frame max)
+6. **BallReID** — keeps track ID stable across occlusions
+7. **Visual** — bounding box with shrinking ellipse comet trail
 
 ---
 
