@@ -90,8 +90,9 @@ BALL_MIN_BBOX_AREA   = 50      # min ball bbox area — rejects noise
 BALL_MAX_TELEPORT_PX = 450     # max pixels ball can move per frame (at 1080p, 60fps)
 BALL_TELEPORT_GRACE  = 10      # frames since last sighting before teleport check resets
 
-# Ball trail
-BALL_TRAIL_MAX       = 30      # max trail points stored
+# Ball interpolation — fill gaps in detection using confirmed neighbors
+BALL_INTERP_BUFFER   = 20      # frames to buffer for look-ahead (~333ms at 60fps)
+BALL_INTERP_MAX_GAP  = 8       # max consecutive missing frames to interpolate
 
 
 _G = (0, 255, 0)
@@ -341,16 +342,27 @@ class JerseyOCR:
 # ---------------------------------------------------------------------------
 
 class BallTracker:
-    """Track ball detections — pick best detection per frame, use velocity
-    detection-only mode — only draws when actually detected.
-    Stores last known position so SAHI can target that region.
-    Maintains a trail of recent positions for drawing."""
+    """Track ball detections — pick best detection per frame.
+    Detection-only mode — only returns results when actually detected.
+    Uses velocity + direction history to adaptively size the search zone:
+      - Ball moving fast (pass/shot) → wider search in direction of travel
+      - Ball stationary (held) → tight search zone around last position
+    Stores last known position so SAHI can target that region."""
+
+    _VEL_HISTORY = 5       # frames of velocity history to average
+    _BASE_RADIUS = 80      # minimum search radius in pixels (stationary ball)
+    _VEL_SCALE   = 3.0     # multiply avg speed by this for search radius
+    _MAX_RADIUS  = 500     # cap so we don't accept anything on screen
+    _DIR_BONUS   = 1.5     # extra radius multiplier in the direction of travel
 
     def __init__(self):
         self._last_box: list | None = None
         self._last_seen_frame: int = -999
-        self._trail: deque = deque(maxlen=BALL_TRAIL_MAX)
         self._frames_since: int = 0
+        # Velocity history: list of (vx, vy) in pixels/frame
+        self._vel_history: deque = deque(maxlen=self._VEL_HISTORY)
+        self._last_cx: float = 0.0
+        self._last_cy: float = 0.0
 
     @property
     def last_center(self) -> tuple | None:
@@ -363,23 +375,268 @@ class BallTracker:
     def frames_since_seen(self) -> int:
         return self._frames_since
 
-    @property
-    def trail(self) -> list:
-        return list(self._trail)
+    def _avg_velocity(self) -> tuple:
+        """Average velocity (vx, vy) over recent history."""
+        if not self._vel_history:
+            return (0.0, 0.0)
+        vx = sum(v[0] for v in self._vel_history) / len(self._vel_history)
+        vy = sum(v[1] for v in self._vel_history) / len(self._vel_history)
+        return (vx, vy)
+
+    def _search_radius(self) -> float:
+        """Adaptive search radius based on recent ball speed."""
+        vx, vy = self._avg_velocity()
+        speed = math.hypot(vx, vy)
+        radius = self._BASE_RADIUS + speed * self._VEL_SCALE
+        return min(radius, self._MAX_RADIUS)
+
+    def _direction_score(self, det_cx: float, det_cy: float) -> float:
+        """Score a detection by how well it aligns with the ball's travel
+        direction. Returns a multiplier: 1.0 = perpendicular/stationary,
+        up to _DIR_BONUS = in the direction of travel."""
+        vx, vy = self._avg_velocity()
+        speed = math.hypot(vx, vy)
+        if speed < 3.0:
+            # Ball is essentially stationary — direction doesn't matter
+            return 1.0
+        # Vector from last position to detection
+        dx = det_cx - self._last_cx
+        dy = det_cy - self._last_cy
+        det_dist = math.hypot(dx, dy)
+        if det_dist < 1.0:
+            return self._DIR_BONUS  # on top of last position = good
+        # Cosine similarity between velocity direction and detection direction
+        cos_sim = (vx * dx + vy * dy) / (speed * det_dist)
+        # Map from [-1, 1] to [1.0, _DIR_BONUS]: ahead = bonus, behind = 1.0
+        return 1.0 + max(0.0, cos_sim) * (self._DIR_BONUS - 1.0)
 
     def update(self, frame_idx: int, ball_dets: list) -> list:
-        """Return ball detection to draw. No prediction — only real detections."""
+        """Return ball detection to draw. No prediction — only real detections.
+        Uses velocity-adaptive search zone + direction preference."""
         self._frames_since = frame_idx - self._last_seen_frame
         if not ball_dets:
             return []
-        best = max(ball_dets, key=lambda d:
-                   (d["box"][2]-d["box"][0]) * (d["box"][3]-d["box"][1]))
+
+        if self._last_box is not None:
+            search_r = self._search_radius()
+            # Account for frames since last seen — ball could have traveled further
+            gap = max(1, self._frames_since)
+            search_r = min(search_r * gap, self._MAX_RADIUS)
+
+            scored = []
+            for d in ball_dets:
+                cx = (d["box"][0] + d["box"][2]) / 2.0
+                cy = (d["box"][1] + d["box"][3]) / 2.0
+                dist = math.hypot(cx - self._last_cx, cy - self._last_cy)
+                if dist < search_r:
+                    # Lower score = better. Direction bonus reduces effective distance.
+                    dir_mult = self._direction_score(cx, cy)
+                    effective_dist = dist / dir_mult
+                    scored.append((effective_dist, d, cx, cy))
+
+            if scored:
+                scored.sort(key=lambda x: x[0])
+                best = scored[0][1]
+                best_cx, best_cy = scored[0][2], scored[0][3]
+            else:
+                # Nothing in search zone — pick largest (new ball / reacquisition)
+                best = max(ball_dets, key=lambda d:
+                           (d["box"][2]-d["box"][0]) * (d["box"][3]-d["box"][1]))
+                best_cx = (best["box"][0] + best["box"][2]) / 2.0
+                best_cy = (best["box"][1] + best["box"][3]) / 2.0
+        else:
+            # First detection ever — pick largest
+            best = max(ball_dets, key=lambda d:
+                       (d["box"][2]-d["box"][0]) * (d["box"][3]-d["box"][1]))
+            best_cx = (best["box"][0] + best["box"][2]) / 2.0
+            best_cy = (best["box"][1] + best["box"][3]) / 2.0
+
+        # Update velocity history
+        if self._last_box is not None and self._frames_since <= 3:
+            gap = max(1, self._frames_since)
+            vx = (best_cx - self._last_cx) / gap
+            vy = (best_cy - self._last_cy) / gap
+            self._vel_history.append((vx, vy))
+        elif self._frames_since > 10:
+            # Lost too long — reset velocity history
+            self._vel_history.clear()
+
         self._last_box = best["box"]
+        self._last_cx = best_cx
+        self._last_cy = best_cy
         self._last_seen_frame = frame_idx
-        cx = (best["box"][0] + best["box"][2]) / 2.0
-        cy = (best["box"][1] + best["box"][3]) / 2.0
-        self._trail.append((cx, cy))
         return [best]
+
+
+class BallInterpolator:
+    """Buffer frames and fill ball detection gaps using confirmed neighbors.
+    Since this is post-game review, we can look ahead before finalizing output.
+    Uses a sliding window of BALL_INTERP_BUFFER frames."""
+
+    def __init__(self, max_teleport: float):
+        self._buffer: list = []   # list of (frame_image, ball_box_or_None)
+        self._max_teleport = max_teleport
+
+    def push(self, frame: np.ndarray, ball_box: list | None):
+        """Add a frame and its ball detection (or None) to the buffer."""
+        self._buffer.append((frame, ball_box))
+
+    def _interpolate_box(self, box_a: list, box_b: list, t: float) -> list:
+        """Linearly interpolate between two boxes. t=0 → box_a, t=1 → box_b."""
+        return [int(box_a[i] + (box_b[i] - box_a[i]) * t) for i in range(4)]
+
+    def _box_dist(self, box_a: list, box_b: list) -> float:
+        """Distance between box centers."""
+        cx_a = (box_a[0] + box_a[2]) / 2.0
+        cy_a = (box_a[1] + box_a[3]) / 2.0
+        cx_b = (box_b[0] + box_b[2]) / 2.0
+        cy_b = (box_b[1] + box_b[3]) / 2.0
+        return math.hypot(cx_a - cx_b, cy_a - cy_b)
+
+    def _reject_outliers(self):
+        """Remove short detection spikes that are likely false positives.
+        If a detection at frame N is far from both neighbors (N-1 and N+1)
+        but those neighbors are close to each other, N is an outlier.
+        Works for spikes of 1-2 frames."""
+        n = len(self._buffer)
+        if n < 3:
+            return
+
+        # Pass 1: mark single-frame outliers
+        for i in range(1, n - 1):
+            curr = self._buffer[i][1]
+            if curr is None:
+                continue
+            # Find nearest detection before and after
+            prev_box = None
+            for j in range(i - 1, max(i - 4, -1), -1):
+                if self._buffer[j][1] is not None:
+                    prev_box = self._buffer[j][1]
+                    break
+            next_box = None
+            for j in range(i + 1, min(i + 4, n)):
+                if self._buffer[j][1] is not None:
+                    next_box = self._buffer[j][1]
+                    break
+
+            if prev_box is None or next_box is None:
+                continue
+
+            dist_to_prev = self._box_dist(curr, prev_box)
+            dist_to_next = self._box_dist(curr, next_box)
+            dist_prev_next = self._box_dist(prev_box, next_box)
+
+            # Outlier: current is far from both neighbors, but neighbors are
+            # close to each other (ball didn't actually move there and back)
+            outlier_thresh = self._max_teleport * 0.6
+            if (dist_to_prev > outlier_thresh and
+                    dist_to_next > outlier_thresh and
+                    dist_prev_next < outlier_thresh):
+                # This detection jumped away and came back — false positive
+                frame_img = self._buffer[i][0]
+                self._buffer[i] = (frame_img, None)
+
+        # Pass 2: mark 2-frame spike outliers (A→B→B→A pattern)
+        for i in range(1, n - 2):
+            curr = self._buffer[i][1]
+            curr_next = self._buffer[i + 1][1]
+            if curr is None or curr_next is None:
+                continue
+
+            # Check if these two frames are close to each other (same spike)
+            if self._box_dist(curr, curr_next) > self._max_teleport * 0.3:
+                continue  # not a coherent spike
+
+            # Find detection before and after the 2-frame block
+            prev_box = None
+            for j in range(i - 1, max(i - 4, -1), -1):
+                if self._buffer[j][1] is not None:
+                    prev_box = self._buffer[j][1]
+                    break
+            next_box = None
+            for j in range(i + 2, min(i + 5, n)):
+                if self._buffer[j][1] is not None:
+                    next_box = self._buffer[j][1]
+                    break
+
+            if prev_box is None or next_box is None:
+                continue
+
+            dist_spike_prev = self._box_dist(curr, prev_box)
+            dist_spike_next = self._box_dist(curr_next, next_box)
+            dist_prev_next = self._box_dist(prev_box, next_box)
+
+            outlier_thresh = self._max_teleport * 0.6
+            if (dist_spike_prev > outlier_thresh and
+                    dist_spike_next > outlier_thresh and
+                    dist_prev_next < outlier_thresh):
+                frame_a = self._buffer[i][0]
+                frame_b = self._buffer[i + 1][0]
+                self._buffer[i] = (frame_a, None)
+                self._buffer[i + 1] = (frame_b, None)
+
+    def _fill_gaps(self):
+        """Reject outlier spikes, then fill gaps with interpolated positions."""
+        self._reject_outliers()
+        n = len(self._buffer)
+        i = 0
+        while i < n:
+            if self._buffer[i][1] is not None:
+                i += 1
+                continue
+            # Found a gap start — find gap end
+            gap_start = i
+            while i < n and self._buffer[i][1] is None:
+                i += 1
+            gap_end = i  # first frame after gap with detection (or end of buffer)
+            gap_len = gap_end - gap_start
+
+            if gap_len > BALL_INTERP_MAX_GAP:
+                continue  # gap too long, don't interpolate
+
+            # Need detections on BOTH sides
+            if gap_start == 0 or gap_end >= n:
+                continue
+            box_before = self._buffer[gap_start - 1][1]
+            box_after  = self._buffer[gap_end][1]
+            if box_before is None or box_after is None:
+                continue
+
+            # Check distance is reasonable
+            dist = self._box_dist(box_before, box_after)
+            if dist > self._max_teleport * (gap_len + 1):
+                continue  # ball moved too far, likely different object
+
+            # Interpolate each gap frame
+            for j in range(gap_start, gap_end):
+                t = (j - gap_start + 1) / (gap_len + 1)
+                interp_box = self._interpolate_box(box_before, box_after, t)
+                frame_img = self._buffer[j][0]
+                self._buffer[j] = (frame_img, interp_box)
+
+    def pop_ready(self) -> list:
+        """Return finalized frames that are safe to write.
+        Keeps BALL_INTERP_BUFFER//2 frames buffered for look-ahead."""
+        half = BALL_INTERP_BUFFER // 2
+        if len(self._buffer) < BALL_INTERP_BUFFER:
+            return []
+        # Fill gaps in current buffer
+        self._fill_gaps()
+        # Pop frames that are far enough from the buffer edge
+        ready = []
+        while len(self._buffer) > half:
+            frame_img, ball_box = self._buffer.pop(0)
+            ready.append((frame_img, ball_box))
+        return ready
+
+    def flush(self) -> list:
+        """Flush all remaining frames at end of video."""
+        self._fill_gaps()
+        ready = []
+        while self._buffer:
+            frame_img, ball_box = self._buffer.pop(0)
+            ready.append((frame_img, ball_box))
+        return ready
 
 
 class BallReID:
@@ -510,6 +767,7 @@ def run_sahi_ball_targeted(
     frame: np.ndarray,
     center: tuple,
     existing_ball_dets: list,
+    ball_cls_id: int = COCO_BALL_CLS,
 ) -> list:
     """Run SAHI on a small crop around the ball's last known position.
     Much faster than full-frame slicing — only processes the region
@@ -542,7 +800,7 @@ def run_sahi_ball_targeted(
 
     sahi_balls: list = []
     for pred in result.object_prediction_list:
-        if int(pred.category.id) != COCO_BALL_CLS:
+        if int(pred.category.id) != ball_cls_id:
             continue
         if pred.score.value < SAHI_CONF_THRESH:
             continue
@@ -716,59 +974,6 @@ def draw_ball(frame, box, label="BALL"):
     cv2.rectangle(frame, (x1, y1), (x2, y2), C_BALL, 2, cv2.LINE_AA)
     _label_bg(frame, x1, y1 - 3, label, C_BALL)
 
-
-def draw_ball_trail(frame, trail: list, ball_box: list | None = None):
-    """Draw comet trail of shrinking ball ellipses behind the ball.
-    Each ghost is a smaller, more transparent copy of the ball shape."""
-    n = len(trail)
-    if n < 2 or ball_box is None:
-        return
-
-    bw = ball_box[2] - ball_box[0]
-    bh = ball_box[3] - ball_box[1]
-    ball_rx = max(1, bw // 2)
-    ball_ry = max(1, bh // 2)
-    max_trail_len = max(bw, bh) * 2.0
-
-    # Build trail points with cumulative distance from head, capped at max_trail_len
-    points = []  # (cx, cy, cumulative_dist)
-    cumulative = 0.0
-    for i in range(n - 1, 0, -1):
-        dx = trail[i][0] - trail[i - 1][0]
-        dy = trail[i][1] - trail[i - 1][1]
-        seg_len = math.hypot(dx, dy)
-        if cumulative + seg_len > max_trail_len:
-            break
-        cumulative += seg_len
-        points.append((trail[i - 1][0], trail[i - 1][1], cumulative))
-
-    if not points:
-        return
-    total_len = points[-1][2]
-    if total_len < 1:
-        return
-
-    # Draw tail-first so closer ghosts render on top
-    overlay = frame.copy()
-    for (cx, cy, cum_dist) in reversed(points):
-        # t = 0 at head, 1 at tail
-        t = cum_dist / total_len
-        # Quadratic falloff — shrinks and fades fast
-        alpha = (1.0 - t) ** 2
-        if alpha < 0.03:
-            continue
-        # Shrink ellipse radii: full size at head → tiny at tail (min 2px)
-        rx = max(2, int(ball_rx * (1.0 - t * 0.8)))
-        ry = max(2, int(ball_ry * (1.0 - t * 0.8)))
-        # Color fades from bright red to dark
-        r = int(255 * alpha)
-        g = int(40 * alpha)
-        color = (0, g, r)
-        icx, icy = int(cx), int(cy)
-        cv2.ellipse(overlay, (icx, icy), (rx, ry), 0, 0, 360, color, -1)
-
-    # Blend the trail overlay onto the frame
-    cv2.addWeighted(overlay, 0.4, frame, 0.6, 0, frame)
 
 
 def draw_hoop(frame, box):
@@ -964,13 +1169,13 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
     print("Loading COCO pretrained model (sports ball fallback) ...")
     coco_model = YOLO("yolo11s.pt")
 
-    # SAHI — sliced inference using COCO model for better ball detection
+    # SAHI — sliced inference using COCO model for ball detection
     sahi_model = None
     if use_sahi:
         print("Loading SAHI sliced-inference model (COCO sports ball) ...")
         sahi_model = AutoDetectionModel.from_pretrained(
             model_type="yolov8",          # compatible with YOLO11
-            model_path="yolo11s.pt",      # COCO pretrained — strong sports ball class
+            model_path="yolo11s.pt",      # COCO pretrained — sports ball class
             confidence_threshold=SAHI_CONF_THRESH,
             device=device,
         )
@@ -987,6 +1192,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
     ball_tracker  = BallTracker()
     ball_reid     = BallReID()
     ball_validator = BallValidator(roi_poly, frame_w, frame_h)
+    ball_interp   = BallInterpolator(max_teleport=BALL_MAX_TELEPORT_PX * (frame_w / 1920.0))
 
     fourcc    = cv2.VideoWriter_fourcc(*"mp4v")
     out_video = cv2.VideoWriter(
@@ -1011,7 +1217,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
 
         det_res = model.track(
             frame, persist=True, tracker=tracker_cfg,
-            conf=0.15, iou=0.45,
+            conf=0.10, iou=0.45,
             imgsz=infer_imgsz, device=device, half=use_half,
             verbose=False,
         )[0]
@@ -1034,7 +1240,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                         continue
                     raw_dets.append({"tid": tid, "box": box_list, "label": LABEL_PLAYER})
                 elif cls_id == CLS_BALL:
-                    if conf_val < 0.20:
+                    if conf_val < 0.25:
                         continue
                     ball_dets.append({"tid": tid, "box": box_list, "cls": CLS_BALL})
                 elif cls_id == CLS_HOOP:
@@ -1077,8 +1283,10 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         if sahi_model is not None:
             center = ball_tracker.last_center
             if center is not None and ball_tracker.frames_since_seen < SAHI_MAX_LOST:
+                # COCO SAHI — sports ball class
                 sahi_balls = run_sahi_ball_targeted(
-                    sahi_model, frame, center, ball_dets)
+                    sahi_model, frame, center, ball_dets,
+                    ball_cls_id=COCO_BALL_CLS)
                 ball_dets.extend(sahi_balls)
             elif center is None or ball_tracker.frames_since_seen >= SAHI_MAX_LOST:
                 # No prior position or ball lost too long — run full-frame SAHI
@@ -1135,19 +1343,13 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         ball_dets    = ball_reid.update(frame_idx, ball_dets)
         ball_to_draw = ball_tracker.update(frame_idx, ball_dets)
 
-        # ---- 6. Draw ball / hoop / ref ---------------------------------------
-        ball_box_for_trail = ball_to_draw[0]["box"] if ball_to_draw else None
-        draw_ball_trail(frame, ball_tracker.trail, ball_box_for_trail)
-        for det in ball_to_draw:
-            draw_ball(frame, det["box"])
-
+        # ---- 6. Draw hoop / ref / players (everything except ball) ------------
         for det in hoop_dets:
             draw_hoop(frame, det["box"])
 
         for det in ref_dets:
             draw_ref(frame, det["box"], det["tid"])
 
-        # ---- 7. Draw real players + skeletons --------------------------------
         for d in real_dets:
             tid = d["tid"]
             jersey = jersey_ocr.get_jersey(tid)
@@ -1156,7 +1358,17 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
             if tid in pose_map:
                 draw_skeleton(frame, *pose_map[tid])
 
-        out_video.write(frame)
+        # ---- 7. Buffer frame for ball interpolation --------------------------
+        # Ball is NOT drawn yet — the interpolator will fill gaps first.
+        ball_box = ball_to_draw[0]["box"] if ball_to_draw else None
+        ball_interp.push(frame, ball_box)
+
+        # Write finalized frames (interpolator releases them after look-ahead)
+        for fin_frame, fin_ball_box in ball_interp.pop_ready():
+            if fin_ball_box is not None:
+                draw_ball(fin_frame, fin_ball_box)
+            out_video.write(fin_frame)
+
         frame_idx += 1
 
         t_frame = time.perf_counter() - t_frame_start
@@ -1168,6 +1380,12 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                   f"| jerseys={n_jerseys}  "
                   f"| poses={len(pose_map)}  "
                   f"| ball={'YES' if ball_to_draw else 'no'}")
+
+    # Flush remaining buffered frames
+    for fin_frame, fin_ball_box in ball_interp.flush():
+        if fin_ball_box is not None:
+            draw_ball(fin_frame, fin_ball_box)
+        out_video.write(fin_frame)
 
     cap.release()
     out_video.release()
