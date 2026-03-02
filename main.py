@@ -2,7 +2,7 @@
 UVA Men's Basketball CV Pipeline — Detection + Tracking + Pose
 
 Usage:
-  Fine-tune : python main.py --finetune [--epochs 250] [--batch 16]
+  Fine-tune : python main.py --finetune [--epochs 50] [--batch 16]
   Inference : python main.py [--video data/game_01.mp4] [--weights path/to/best.pt]
 
 Dataset (data/custom_annotations/data.yaml):
@@ -58,7 +58,7 @@ C_BALL   = (0,     0, 255)     # red
 C_HOOP   = (255, 255, 255)     # white
 C_REF    = (180,  60,  20)     # dark blue
 
-REID_BUFFER_FRAMES = 180    # frames to remember lost player tracks (~3s at 60fps)
+REID_BUFFER_FRAMES = 600    # frames to remember lost player tracks (~10s at 60fps)
 REID_DIST_THRESH   = 300    # max pixel distance to re-associate a lost player track
 
 BALL_REID_BUFFER   = 240    # frames to remember lost ball track (~4s at 60fps)
@@ -154,8 +154,12 @@ class TrackMemory:
 
 class TemporalReIDBuffer:
     def __init__(self):
-        self._lost:     dict = {}
+        self._lost:     dict = {}          # tid → (frame_lost, cx, cy)
         self._id_remap: dict = {}
+        self._jersey_ocr: "JerseyOCR | None" = None
+
+    def set_jersey_ocr(self, jersey_ocr: "JerseyOCR"):
+        self._jersey_ocr = jersey_ocr
 
     def update(self, frame_idx: int, raw_dets: list) -> list:
         expired = [
@@ -172,17 +176,34 @@ class TemporalReIDBuffer:
                 continue
             cx = (d["box"][0] + d["box"][2]) / 2.0
             cy = (d["box"][1] + d["box"][3]) / 2.0
+
             best_old_tid = None
             best_dist    = REID_DIST_THRESH
-            for old_tid, (_, ox, oy) in self._lost.items():
-                dist = math.hypot(cx - ox, cy - oy)
-                if dist < best_dist:
-                    best_dist    = dist
-                    best_old_tid = old_tid
+
+            # --- Jersey-based matching (high priority, ignores distance) ---
+            if self._jersey_ocr is not None:
+                new_jersey = self._jersey_ocr.get_jersey(tid)
+                if new_jersey is not None:
+                    for old_tid in list(self._lost.keys()):
+                        old_jersey = self._jersey_ocr.get_jersey(old_tid)
+                        if old_jersey == new_jersey:
+                            best_old_tid = old_tid
+                            break
+
+            # --- Proximity fallback (if no jersey match) ---
+            if best_old_tid is None:
+                for old_tid, (_, ox, oy) in self._lost.items():
+                    dist = math.hypot(cx - ox, cy - oy)
+                    if dist < best_dist:
+                        best_dist    = dist
+                        best_old_tid = old_tid
+
             if best_old_tid is not None:
                 self._id_remap[tid] = best_old_tid
                 del self._lost[best_old_tid]
                 d["tid"] = best_old_tid
+                if self._jersey_ocr is not None:
+                    self._jersey_ocr.transfer_id(best_old_tid, best_old_tid)
 
         return raw_dets
 
@@ -290,18 +311,20 @@ class JerseyOCR:
     def get_jersey(self, tid: int) -> str | None:
         return self._confirmed.get(tid)
 
+    def needs_scan(self, tid: int) -> bool:
+        """Unconfirmed players need more frequent OCR."""
+        return tid not in self._confirmed
+
     def scan(self, frame: np.ndarray, detections: list):
-        """Run OCR on player crops. Call every OCR_INTERVAL frames."""
+        """Run OCR on player crops."""
         for d in detections:
             tid = d["tid"]
             if tid in self._confirmed:
                 continue
             box = d["box"]
-            # Crop upper 55% of bbox (torso/jersey area)
             x1, y1, x2, y2 = box
             h = y2 - y1
             crop_y2 = y1 + int(h * 0.55)
-            # Slight horizontal padding inward to avoid arms
             w = x2 - x1
             crop_x1 = x1 + int(w * 0.15)
             crop_x2 = x2 - int(w * 0.15)
@@ -315,18 +338,19 @@ class JerseyOCR:
                                             paragraph=False, min_size=10)
             for (_, text, conf) in results:
                 text = text.strip()
-                # Filter to valid jersey numbers (1-99)
                 if not re.match(r"^\d{1,2}$", text):
                     continue
                 num = int(text)
-                if num < 0 or num > 99:
+                if num < 1 or num > 99:
                     continue
                 jersey = str(num)
                 if tid not in self._candidates:
                     self._candidates[tid] = {}
                 self._candidates[tid][jersey] = self._candidates[tid].get(jersey, 0) + 1
-                # Lock once we see the same number enough times
-                if self._candidates[tid][jersey] >= OCR_CONFIRM_COUNT:
+                # Lock: needs OCR_CONFIRM_COUNT reads AND must be the plurality
+                cands = self._candidates[tid]
+                top_jersey = max(cands, key=cands.get)
+                if cands[top_jersey] >= OCR_CONFIRM_COUNT and top_jersey == jersey:
                     self._confirmed[tid] = jersey
                     self._candidates.pop(tid, None)
                     break
@@ -335,6 +359,112 @@ class JerseyOCR:
         """When Re-ID remaps a track, carry the jersey number over."""
         if old_tid in self._confirmed:
             self._confirmed[new_tid] = self._confirmed[old_tid]
+
+
+# ---------------------------------------------------------------------------
+# Team Classification — K-means on jersey color histograms
+# ---------------------------------------------------------------------------
+
+TEAM_SAMPLE_COUNT = 100   # player crops to collect before clustering
+TEAM_COLORS = [(255, 140, 0), (0, 180, 255)]  # BGR: orange (team A), cyan (team B)
+
+class TeamClassifier:
+    """Auto-detect two teams from jersey colors using K-means clustering."""
+
+    def __init__(self):
+        self._samples: list  = []     # list of (tid, color_hist)
+        self._labels:  dict  = {}     # tid → 0 or 1 (team index)
+        self._centers         = None  # K-means cluster centers
+        self._ready           = False
+
+    def is_ready(self) -> bool:
+        return self._ready
+
+    def get_team(self, tid: int) -> int | None:
+        return self._labels.get(tid)
+
+    def get_team_color(self, tid: int):
+        team = self._labels.get(tid)
+        if team is not None:
+            return TEAM_COLORS[team]
+        return None
+
+    def collect(self, frame: np.ndarray, detections: list):
+        """Collect upper-torso color histograms from player detections."""
+        if self._ready:
+            return
+        for d in detections:
+            tid = d["tid"]
+            if any(s[0] == tid for s in self._samples):
+                continue  # already sampled this tid
+            box = d["box"]
+            x1, y1, x2, y2 = box
+            h = y2 - y1
+            w = x2 - x1
+            # Crop upper-middle torso (avoid arms, head)
+            crop_y1 = y1 + int(h * 0.15)
+            crop_y2 = y1 + int(h * 0.55)
+            crop_x1 = x1 + int(w * 0.20)
+            crop_x2 = x2 - int(w * 0.20)
+            if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+                continue
+            crop = frame[max(0, crop_y1):crop_y2, max(0, crop_x1):crop_x2]
+            if crop.size == 0:
+                continue
+            hist = self._color_hist(crop)
+            self._samples.append((tid, hist))
+
+        if len(self._samples) >= TEAM_SAMPLE_COUNT:
+            self._cluster()
+
+    def _color_hist(self, crop: np.ndarray) -> np.ndarray:
+        """Compute a normalized HSV hue+saturation histogram."""
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        # 16 hue bins, 8 saturation bins = 128-dim feature
+        hist = cv2.calcHist([hsv], [0, 1], None, [16, 8],
+                            [0, 180, 0, 256])
+        cv2.normalize(hist, hist)
+        return hist.flatten()
+
+    def _cluster(self):
+        """Run K-means (k=2) on collected histograms."""
+        data = np.array([s[1] for s in self._samples], dtype=np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+                    100, 0.2)
+        _, labels, centers = cv2.kmeans(data, 2, None, criteria, 10,
+                                        cv2.KMEANS_PP_CENTERS)
+        self._centers = centers
+        for i, (tid, _) in enumerate(self._samples):
+            self._labels[tid] = int(labels[i][0])
+        self._ready = True
+        print(f"  Team classifier ready ({len(self._samples)} samples, 2 clusters)")
+
+    def classify(self, frame: np.ndarray, det: dict) -> int | None:
+        """Classify a new player detection into team 0 or 1."""
+        if not self._ready or self._centers is None:
+            return None
+        tid = det["tid"]
+        if tid in self._labels:
+            return self._labels[tid]
+        box = det["box"]
+        x1, y1, x2, y2 = box
+        h = y2 - y1
+        w = x2 - x1
+        crop_y1 = y1 + int(h * 0.15)
+        crop_y2 = y1 + int(h * 0.55)
+        crop_x1 = x1 + int(w * 0.20)
+        crop_x2 = x2 - int(w * 0.20)
+        if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+            return None
+        crop = frame[max(0, crop_y1):crop_y2, max(0, crop_x1):crop_x2]
+        if crop.size == 0:
+            return None
+        hist = self._color_hist(crop)
+        # Assign to nearest cluster center
+        dists = [np.linalg.norm(hist - c) for c in self._centers]
+        team = int(np.argmin(dists))
+        self._labels[tid] = team
+        return team
 
 
 # ---------------------------------------------------------------------------
@@ -485,6 +615,28 @@ class BallInterpolator:
         """Linearly interpolate between two boxes. t=0 → box_a, t=1 → box_b."""
         return [int(box_a[i] + (box_b[i] - box_a[i]) * t) for i in range(4)]
 
+    def _interpolate_box_arc(self, box_a: list, box_b: list, t: float,
+                             gap_len: int) -> list:
+        """Quadratic interpolation with gravity for arcing ball trajectories.
+        Adds a downward parabolic offset to the Y axis — peaks at t=0.5."""
+        # Linear base for all 4 coords
+        box = [box_a[i] + (box_b[i] - box_a[i]) * t for i in range(4)]
+        # Gravity arc: ball rises then falls. Peak offset at midpoint.
+        # Scale arc height by horizontal distance and gap length.
+        cx_a = (box_a[0] + box_a[2]) / 2.0
+        cy_a = (box_a[1] + box_a[3]) / 2.0
+        cx_b = (box_b[0] + box_b[2]) / 2.0
+        cy_b = (box_b[1] + box_b[3]) / 2.0
+        horiz_dist = abs(cx_b - cx_a)
+        # Arc height: proportional to horizontal distance, capped
+        arc_height = min(horiz_dist * 0.3, gap_len * 15.0)
+        # Parabolic offset: negative because Y increases downward in image coords
+        # Ball goes UP (y decreases) then comes back down
+        y_offset = -arc_height * 4.0 * t * (1.0 - t)
+        box[1] += y_offset  # y1
+        box[3] += y_offset  # y2
+        return [int(v) for v in box]
+
     def _box_dist(self, box_a: list, box_b: list) -> float:
         """Distance between box centers."""
         cx_a = (box_a[0] + box_a[2]) / 2.0
@@ -497,24 +649,26 @@ class BallInterpolator:
         """Remove short detection spikes that are likely false positives.
         If a detection at frame N is far from both neighbors (N-1 and N+1)
         but those neighbors are close to each other, N is an outlier.
-        Works for spikes of 1-2 frames."""
+        Works for spikes of 1-3 frames."""
         n = len(self._buffer)
         if n < 3:
             return
+
+        # How far to search for neighbor detections (allows gaps)
+        LOOK = 8
 
         # Pass 1: mark single-frame outliers
         for i in range(1, n - 1):
             curr = self._buffer[i][1]
             if curr is None:
                 continue
-            # Find nearest detection before and after
             prev_box = None
-            for j in range(i - 1, max(i - 4, -1), -1):
+            for j in range(i - 1, max(i - LOOK, -1), -1):
                 if self._buffer[j][1] is not None:
                     prev_box = self._buffer[j][1]
                     break
             next_box = None
-            for j in range(i + 1, min(i + 4, n)):
+            for j in range(i + 1, min(i + LOOK, n)):
                 if self._buffer[j][1] is not None:
                     next_box = self._buffer[j][1]
                     break
@@ -526,13 +680,15 @@ class BallInterpolator:
             dist_to_next = self._box_dist(curr, next_box)
             dist_prev_next = self._box_dist(prev_box, next_box)
 
-            # Outlier: current is far from both neighbors, but neighbors are
-            # close to each other (ball didn't actually move there and back)
-            outlier_thresh = self._max_teleport * 0.6
-            if (dist_to_prev > outlier_thresh and
-                    dist_to_next > outlier_thresh and
-                    dist_prev_next < outlier_thresh):
-                # This detection jumped away and came back — false positive
+            # Outlier if BOTH conditions hold:
+            # 1. Current jumped away from both neighbors more than they
+            #    moved relative to each other (ratio test)
+            # 2. Neighbors are reasonably close (didn't both teleport)
+            min_jump = max(dist_to_prev, dist_to_next)
+            # Spike jumps 3x+ further than the neighbors moved apart
+            is_spike = (min_jump > dist_prev_next * 3.0 + 20.0 and
+                        dist_to_prev > 30.0 and dist_to_next > 30.0)
+            if is_spike:
                 frame_img = self._buffer[i][0]
                 self._buffer[i] = (frame_img, None)
 
@@ -543,18 +699,16 @@ class BallInterpolator:
             if curr is None or curr_next is None:
                 continue
 
-            # Check if these two frames are close to each other (same spike)
             if self._box_dist(curr, curr_next) > self._max_teleport * 0.3:
                 continue  # not a coherent spike
 
-            # Find detection before and after the 2-frame block
             prev_box = None
-            for j in range(i - 1, max(i - 4, -1), -1):
+            for j in range(i - 1, max(i - LOOK, -1), -1):
                 if self._buffer[j][1] is not None:
                     prev_box = self._buffer[j][1]
                     break
             next_box = None
-            for j in range(i + 2, min(i + 5, n)):
+            for j in range(i + 2, min(i + 2 + LOOK, n)):
                 if self._buffer[j][1] is not None:
                     next_box = self._buffer[j][1]
                     break
@@ -566,14 +720,49 @@ class BallInterpolator:
             dist_spike_next = self._box_dist(curr_next, next_box)
             dist_prev_next = self._box_dist(prev_box, next_box)
 
-            outlier_thresh = self._max_teleport * 0.6
-            if (dist_spike_prev > outlier_thresh and
-                    dist_spike_next > outlier_thresh and
-                    dist_prev_next < outlier_thresh):
+            min_jump = max(dist_spike_prev, dist_spike_next)
+            is_spike = (min_jump > dist_prev_next * 3.0 + 20.0 and
+                        dist_spike_prev > 30.0 and dist_spike_next > 30.0)
+            if is_spike:
                 frame_a = self._buffer[i][0]
                 frame_b = self._buffer[i + 1][0]
                 self._buffer[i] = (frame_a, None)
                 self._buffer[i + 1] = (frame_b, None)
+
+        # Pass 3: mark 3-frame spike outliers (A→B→B→B→A pattern)
+        for i in range(1, n - 3):
+            frames = [self._buffer[i + k][1] for k in range(3)]
+            if any(f is None for f in frames):
+                continue
+            if (self._box_dist(frames[0], frames[1]) > self._max_teleport * 0.3 or
+                    self._box_dist(frames[1], frames[2]) > self._max_teleport * 0.3):
+                continue
+
+            prev_box = None
+            for j in range(i - 1, max(i - LOOK, -1), -1):
+                if self._buffer[j][1] is not None:
+                    prev_box = self._buffer[j][1]
+                    break
+            next_box = None
+            for j in range(i + 3, min(i + 3 + LOOK, n)):
+                if self._buffer[j][1] is not None:
+                    next_box = self._buffer[j][1]
+                    break
+
+            if prev_box is None or next_box is None:
+                continue
+
+            dist_spike_prev = self._box_dist(frames[0], prev_box)
+            dist_spike_next = self._box_dist(frames[2], next_box)
+            dist_prev_next = self._box_dist(prev_box, next_box)
+
+            min_jump = max(dist_spike_prev, dist_spike_next)
+            is_spike = (min_jump > dist_prev_next * 3.0 + 20.0 and
+                        dist_spike_prev > 30.0 and dist_spike_next > 30.0)
+            if is_spike:
+                for k in range(3):
+                    frame_img = self._buffer[i + k][0]
+                    self._buffer[i + k] = (frame_img, None)
 
     def _fill_gaps(self):
         """Reject outlier spikes, then fill gaps with interpolated positions."""
@@ -607,10 +796,15 @@ class BallInterpolator:
             if dist > self._max_teleport * (gap_len + 1):
                 continue  # ball moved too far, likely different object
 
-            # Interpolate each gap frame
+            # Interpolate each gap frame (arc for longer gaps, linear for short)
+            use_arc = gap_len > 3
             for j in range(gap_start, gap_end):
                 t = (j - gap_start + 1) / (gap_len + 1)
-                interp_box = self._interpolate_box(box_before, box_after, t)
+                if use_arc:
+                    interp_box = self._interpolate_box_arc(
+                        box_before, box_after, t, gap_len)
+                else:
+                    interp_box = self._interpolate_box(box_before, box_after, t)
                 frame_img = self._buffer[j][0]
                 self._buffer[j] = (frame_img, interp_box)
 
@@ -701,6 +895,8 @@ class BallValidator:
         self._frame_h = frame_h
         self._last_center: tuple | None = None
         self._last_frame: int = -999
+        self._near_hoop_frame: int = -999      # last frame ball was near a hoop
+        self._near_hoop_box: list | None = None # the hoop box it was near
         # Scale thresholds to resolution (constants are for 1080p)
         scale = (frame_w * frame_h) / (1920 * 1080)
         self._max_area = BALL_MAX_BBOX_AREA * scale
@@ -723,6 +919,13 @@ class BallValidator:
             if area > max_area or area < self._min_area:
                 continue
 
+            # --- Check 1b: Aspect ratio (ball is ~square) ---
+            w = box[2] - box[0]
+            h = box[3] - box[1]
+            aspect = max(w, h) / max(min(w, h), 1)
+            if aspect > 1.8:
+                continue
+
             # --- Check 2: Court column ---
             if not ball_in_court_region(self._roi_poly, cx, cy, self._frame_w):
                 continue
@@ -736,15 +939,40 @@ class BallValidator:
                     if dist > self._max_teleport * gap:
                         continue
 
+            # --- Check 4: Backboard constraint ---
+            # If ball was near a hoop recently, reject detections that jump
+            # ABOVE the hoop into the crowd. Ball can go past horizontally
+            # (airball/bounce) but can't teleport upward into the stands.
+            if (self._near_hoop_box is not None and
+                    frame_idx - self._near_hoop_frame <= 30):
+                hoop_top = self._near_hoop_box[1]  # top Y of hoop box
+                # Ball can't be significantly above the hoop AND past it
+                # horizontally — that's the crowd/backboard area
+                hoop_cx = (self._near_hoop_box[0] + self._near_hoop_box[2]) / 2.0
+                court_cx = self._frame_w / 2.0
+                above_hoop = cy < hoop_top - self._frame_h * 0.03
+                if above_hoop:
+                    if hoop_cx < court_cx and cx < hoop_cx:
+                        continue  # above & behind left hoop
+                    elif hoop_cx >= court_cx and cx > hoop_cx:
+                        continue  # above & behind right hoop
+
             valid.append(d)
 
         # Update history with the best valid detection
         if valid:
             best = max(valid, key=lambda d: (d["box"][2] - d["box"][0]) *
                                              (d["box"][3] - d["box"][1]))
-            self._last_center = ((best["box"][0] + best["box"][2]) / 2.0,
-                                 (best["box"][1] + best["box"][3]) / 2.0)
+            bcx = (best["box"][0] + best["box"][2]) / 2.0
+            bcy = (best["box"][1] + best["box"][3]) / 2.0
+            self._last_center = (bcx, bcy)
             self._last_frame = frame_idx
+            # Track if ball is near a hoop (for backboard constraint)
+            for h in hoop_dets:
+                if self._near_any_hoop(bcx, bcy, [h]):
+                    self._near_hoop_frame = frame_idx
+                    self._near_hoop_box = h["box"]
+                    break
 
         return valid
 
@@ -1045,7 +1273,7 @@ def _oversample_class(data_dir: Path, cls_id: int, cls_name: str, factor: int = 
     return copied
 
 
-def finetune(epochs: int = 200, batch: int = 8, imgsz: int = 960):
+def finetune(epochs: int = 50, batch: int = 8, imgsz: int = 960):
     base_dir  = Path(__file__).resolve().parent
     data_yaml = str(base_dir / "data" / "custom_annotations" / "data.yaml")
 
@@ -1093,10 +1321,9 @@ def finetune(epochs: int = 200, batch: int = 8, imgsz: int = 960):
         # Regularization
         dropout=0.10,          # less dropout needed with more data
         weight_decay=0.0005,   # L2 regularization
-        # Augmentation — moderate color jitter to preserve orange=ball vs skin=head,
-        # but enough variation for lighting/shadow robustness.
-        hsv_h=0.02,            # slight hue shift — keep orange distinguishable from skin
-        hsv_s=0.5,             # moderate saturation — preserve color info
+        # Augmentation — aggressive color jitter to force shape learning over color.
+        hsv_h=0.15,            # strong hue shift — force model to learn shape over color
+        hsv_s=0.7,             # aggressive saturation — weaken color reliance
         hsv_v=0.4,             # brightness jitter — handles shadows, glare
         degrees=10.0,          # slight rotation — preserve court spatial context
         translate=0.2,
@@ -1111,7 +1338,7 @@ def finetune(epochs: int = 200, batch: int = 8, imgsz: int = 960):
         erasing=0.4,           # random erase — partial occlusion robustness
         crop_fraction=1.0,
         # Early stopping — 242 val images = smooth metrics, can stop sooner
-        patience=30,
+        patience=10,
     )
 
     best_pt = base_dir / "runs" / "detect" / "train" / "weights" / "best.pt"
@@ -1189,9 +1416,11 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
 
     print("Loading EasyOCR (jersey number reader) ...")
     jersey_ocr    = JerseyOCR()
+    reid_buffer.set_jersey_ocr(jersey_ocr)
     ball_tracker  = BallTracker()
     ball_reid     = BallReID()
     ball_validator = BallValidator(roi_poly, frame_w, frame_h)
+    team_clf      = TeamClassifier()
     ball_interp   = BallInterpolator(max_teleport=BALL_MAX_TELEPORT_PX * (frame_w / 1920.0))
 
     fourcc    = cv2.VideoWriter_fourcc(*"mp4v")
@@ -1290,8 +1519,8 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                 ball_dets.extend(sahi_balls)
             elif center is None or ball_tracker.frames_since_seen >= SAHI_MAX_LOST:
                 # No prior position or ball lost too long — run full-frame SAHI
-                # every 10 frames to re-acquire without killing performance
-                if frame_idx % 10 == 0:
+                # every 5 frames to re-acquire without killing performance
+                if frame_idx % 5 == 0:
                     result = get_sliced_prediction(
                         image=frame,
                         detection_model=sahi_model,
@@ -1324,10 +1553,13 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                 if d["tid"] in vel_remap:
                     old_tid = d["tid"]
                     d["tid"] = vel_remap[old_tid]
-                    jersey_ocr.transfer_id(vel_remap[old_tid], d["tid"])
+                    jersey_ocr.transfer_id(old_tid, d["tid"])
 
-        # ---- 3. Jersey OCR (every N frames) ----------------------------------
-        if frame_idx % OCR_INTERVAL == 0:
+        # ---- 3. Jersey OCR (adaptive frequency) --------------------------------
+        # Every 10 frames for unconfirmed players, confirmed ones skip inside scan()
+        has_unconfirmed = any(jersey_ocr.needs_scan(d["tid"]) for d in real_dets)
+        ocr_interval = 10 if has_unconfirmed else OCR_INTERVAL
+        if frame_idx % ocr_interval == 0:
             jersey_ocr.scan(frame, real_dets)
 
         # ---- 4. Pose estimation (players only, exclude refs) ------------------
@@ -1350,11 +1582,19 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         for det in ref_dets:
             draw_ref(frame, det["box"], det["tid"])
 
+        # Collect team color samples (before classifier is ready)
+        if not team_clf.is_ready():
+            team_clf.collect(frame, real_dets)
+
         for d in real_dets:
             tid = d["tid"]
             jersey = jersey_ocr.get_jersey(tid)
             label = f"#{jersey}" if jersey else f"#{tid}"
-            draw_player(frame, d["box"], label)
+            team_color = team_clf.get_team_color(tid)
+            if team_color is None and team_clf.is_ready():
+                team_clf.classify(frame, d)
+                team_color = team_clf.get_team_color(tid)
+            draw_player(frame, d["box"], label, color=team_color)
             if tid in pose_map:
                 draw_skeleton(frame, *pose_map[tid])
 
@@ -1405,7 +1645,7 @@ if __name__ == "__main__":
                              "(default: runs/detect/train/weights/best.pt)")
     parser.add_argument("--finetune", action="store_true",
                         help="Train on data/custom_annotations/ then run inference")
-    parser.add_argument("--epochs",   type=int, default=200)
+    parser.add_argument("--epochs",   type=int, default=50)
     parser.add_argument("--batch",    type=int, default=16)
     parser.add_argument("--no-sahi",  action="store_true",
                         help="Disable SAHI sliced inference for ball detection")
