@@ -8,6 +8,8 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
 - Jackson Kennedy
 - Nathan Wan
 - Nathan Todd
+- Hudson Noyes
+- James Sweat
 
 ---
 
