@@ -13,13 +13,77 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
 
 ## Pipeline Architecture
 
+```
+                              ┌─────────────────────────────────┐
+                              │         VIDEO INPUT             │
+                              │   1280x720 @ 60fps (mp4)        │
+                              └───────────────┬─────────────────┘
+                                              │
+                              ┌───────────────▼─────────────────┐
+                              │        FRAME SCHEDULER          │
+                              │  Process every 2nd frame        │
+                              │  (skipped frames reuse results) │
+                              └───────────────┬─────────────────┘
+                                              │
+                 ┌────────────────────────────┼────────────────────────────┐
+                 │                            │                            │
+    ┌────────────▼────────────┐  ┌────────────▼────────────┐  ┌───────────▼───────────┐
+    │   FINE-TUNED YOLO11s    │  │   COCO FALLBACK (11n)   │  │   SAHI SLICED INFER   │
+    │   Detection + Tracking  │  │   "sports ball" cls 32  │  │   Targeted 128px crop │
+    │   4 classes + ByteTrack │  │   Only if no ball found │  │   Only if still no    │
+    │                         │  │                         │  │   ball after COCO     │
+    │   Players, Refs, Hoops  │  │   Ball candidates       │  │   Ball candidates     │
+    └────────┬────────────────┘  └────────────┬────────────┘  └───────────┬───────────┘
+             │                                │                           │
+             └────────────────────────────────┼───────────────────────────┘
+                                              │
+                              ┌───────────────▼─────────────────┐
+                              │       BALL VALIDATION           │
+                              │  Size → Aspect → Court region   │
+                              │  → Teleport → Backboard         │
+                              └───────────────┬─────────────────┘
+                                              │
+                 ┌────────────────────────────┼────────────────────────────┐
+                 │                            │                            │
+    ┌────────────▼────────────┐  ┌────────────▼────────────┐  ┌───────────▼───────────┐
+    │   PLAYER PROCESSING     │  │   BALL TRACKING          │  │   POSE ESTIMATION     │
+    │                         │  │                          │  │                       │
+    │  Re-ID (jersey + prox)  │  │  BallTracker (velocity)  │  │   YOLO11n-pose        │
+    │  Jersey OCR (EasyOCR)   │  │  BallReID (stable IDs)   │  │   Every 3rd processed │
+    │  Team classify (K-means)│  │  BallInterpolator (gaps)  │  │   frame, cached       │
+    │  Velocity tracker       │  │                          │  │                       │
+    └────────┬────────────────┘  └────────────┬────────────┘  └───────────┬───────────┘
+             │                                │                           │
+             └────────────────────────────────┼───────────────────────────┘
+                                              │
+                              ┌───────────────▼─────────────────┐
+                              │         ANNOTATION              │
+                              │  Draw boxes, skeletons, labels  │
+                              │  Team colors, jersey numbers    │
+                              └───────────────┬─────────────────┘
+                                              │
+                              ┌───────────────▼─────────────────┐
+                              │      INTERPOLATION BUFFER       │
+                              │  20-frame look-ahead            │
+                              │  Outlier rejection (1-3 spikes) │
+                              │  Linear + arc gap filling       │
+                              └───────────────┬─────────────────┘
+                                              │
+                              ┌───────────────▼─────────────────┐
+                              │        VIDEO OUTPUT             │
+                              │   Annotated MP4 @ original fps  │
+                              └─────────────────────────────────┘
+```
+
+### Component Summary
+
 | Component | Implementation | Details |
 |---|---|---|
-| Detection | YOLO11s (fine-tuned) + COCO pretrained | Fine-tuned for players/hoop/ref, COCO "sports ball" (class 32) as secondary ball detector |
+| Detection | YOLO11s (fine-tuned) + COCO pretrained | Fine-tuned for players/hoop/ref, COCO "sports ball" (class 32) as conditional fallback |
 | Tracking | ByteTrack | Custom config — 4s track buffer, low thresholds for ball |
-| Pose Estimation | YOLO11n-pose | 17-point COCO skeleton, players only (excludes referees) |
-| Jersey OCR | EasyOCR | Adaptive frequency (every 10 frames unconfirmed, 30 confirmed), majority voting confirmation |
-| Ball Recovery | SAHI (COCO model) | Targeted sliced inference every frame + full-frame fallback every 5 frames when lost |
+| Pose Estimation | YOLO11n-pose | 17-point COCO skeleton, every 3rd processed frame (cached) |
+| Jersey OCR | EasyOCR | Adaptive frequency (every 30 frames unconfirmed, 90 confirmed), majority voting |
+| Ball Recovery | SAHI (COCO model) | Conditional — only when primary + COCO both miss, targeted crop + full-frame fallback |
 | Ball Validation | BallValidator | 5-layer filter: size, aspect ratio, court region, teleport rejection, backboard constraint |
 | Ball Interpolation | BallInterpolator | 20-frame look-ahead buffer, relative outlier rejection (1-3 frame spikes), linear + parabolic gap filling |
 | Ball Tracker | BallTracker | Velocity-adaptive search zone with direction preference (5-frame history, 80-500px radius) |
@@ -59,6 +123,7 @@ uvambb_cv/
 │   └── game_01.mp4                  # Game footage
 ├── runs/detect/train/weights/       # Fine-tuned model weights
 │   ├── best.pt                      # Best val mAP checkpoint
+│   ├── best.engine                  # TensorRT engine (after --export-tensorrt)
 │   └── last.pt                      # Latest epoch checkpoint
 └── output/
     └── annotated.mp4                # Annotated output video
@@ -103,6 +168,14 @@ python main.py --video data/game_01.mp4 [--weights path/to/best.pt]
 ```
 
 Automatically loads `runs/detect/train/weights/best.pt` if no weights specified.
+
+### Export to TensorRT (2-3x faster inference)
+
+```bash
+python main.py --export-tensorrt [--weights path/to/best.pt]
+```
+
+One-time export — engines are GPU-specific and auto-loaded on subsequent runs.
 
 ### Disable SAHI (faster, less ball detection)
 
@@ -155,15 +228,62 @@ match_thresh: 0.70          # Loose for fast ball movement
 
 ---
 
+## Performance Optimizations
+
+The pipeline is optimized to process a full 2-hour game (432K frames at 60fps) within ~24 hours:
+
+```
+  BEFORE                               AFTER
+  ~~~~~~                               ~~~~~
+  ~2.0 s/frame                         ~0.2 s/frame  (estimated)
+  ~10 days per game                    ~24 hours per game
+  3-4 model calls/frame (unconditional) 1-2 model calls/frame (conditional)
+  imgsz=1920 (upscaling 720p video)    imgsz=1280 (native resolution)
+```
+
+| Optimization | Category | Impact | Accuracy Cost |
+|---|---|---|---|
+| Reduce imgsz 1920 → 1280 | Resolution | ~35% faster per call | None (video is 720p) |
+| Conditional COCO fallback | Inference skip | Skips ~50%+ frames | None |
+| Conditional SAHI | Inference skip | Skips most frames | None |
+| `@torch.inference_mode()` | Memory | Reduces overhead | None |
+| TensorRT export (`.engine`) | Compilation | 2-3x per model | None |
+| Frame skipping (every 2nd) | Temporal | 2x total | Negligible at 60fps |
+| Pose every 3rd processed frame | Inference skip | ~67% less pose | Negligible |
+| YOLO11n for COCO fallback | Model size | ~2x when it runs | Minimal |
+| Reduced OCR frequency | CPU savings | Less EasyOCR | Slightly slower convergence |
+| Deque for interpolation buffer | Data structure | O(1) vs O(n) pop | None |
+
+---
+
 ## Ball Detection Pipeline
 
-The basketball is the hardest object to detect (small, fast-moving, similar color to shoes and skin). The pipeline uses a multi-stage approach with temporal analysis:
+The basketball is the hardest object to detect (small, fast-moving, similar color to shoes and skin). The pipeline uses a cascading approach — each stage only fires when the previous one fails:
+
+```
+  Fine-tuned YOLO11s          ← runs every processed frame
+        │
+        ├── ball found? ──YES──→ skip to BallValidator
+        │
+        NO
+        │
+  COCO "sports ball" (11n)   ← only when fine-tuned misses
+        │
+        ├── ball found? ──YES──→ skip to BallValidator
+        │
+        NO
+        │
+  SAHI sliced inference      ← only when both miss
+        │
+        ├── targeted crop (if last position known)
+        └── full-frame scan (if ball lost >60 frames, every 5th frame)
+```
 
 ### Detection Sources
-1. **Fine-tuned model** — detects ball at conf ≥ 0.25 (BallValidator catches false positives)
-2. **COCO pretrained model** — `yolo11s.pt` "sports ball" class (32) at conf ≥ 0.15 as secondary detector
-3. **SAHI targeted** — 128px sliced inference around last known position using COCO model, every frame
-4. **SAHI full-frame** — when ball lost, scans entire frame every 5th frame to re-acquire
+1. **Fine-tuned model** — detects ball at conf >= 0.25 (BallValidator catches false positives)
+2. **COCO pretrained model** — `yolo11n.pt` "sports ball" class (32) at conf >= 0.20, only when fine-tuned model finds no ball
+3. **SAHI targeted** — 128px sliced inference around last known position, only when both primary detectors miss
+4. **SAHI full-frame** — when ball lost >60 frames, scans entire frame every 5th frame to re-acquire
 
 ### Validation (BallValidator)
 Rejects false positives with 5 checks in order:
@@ -200,7 +320,7 @@ Post-game look-ahead analysis with 20-frame sliding buffer:
 
 ### Jersey OCR
 - EasyOCR with digit-only allowlist on upper 55% of player bbox (torso crop)
-- **Adaptive frequency**: every 10 frames for unconfirmed players, every 30 for confirmed
+- **Adaptive frequency**: every 30 frames for unconfirmed players, every 90 for confirmed
 - **Majority voting**: number must have 2+ reads AND be the plurality candidate to lock
 - Confirmed numbers persist permanently, transferred on track ID remaps
 
