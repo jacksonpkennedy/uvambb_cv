@@ -77,7 +77,7 @@ SAHI_MAX_LOST      = 60     # max frames since last ball sighting to run targete
 
 # COCO pretrained ball detection — secondary detector for sports ball (class 32)
 COCO_BALL_CLS      = 32     # "sports ball" in COCO
-COCO_BALL_CONF     = 0.15   # confidence threshold for COCO ball detections
+COCO_BALL_CONF     = 0.20   # confidence threshold for COCO ball detections
 
 # Jersey OCR
 OCR_INTERVAL       = 30     # run OCR every N frames (performance vs accuracy)
@@ -559,17 +559,33 @@ class BallTracker:
                 cy = (d["box"][1] + d["box"][3]) / 2.0
                 dist = math.hypot(cx - self._last_cx, cy - self._last_cy)
                 if dist < search_r:
-                    # Lower score = better. Direction bonus reduces effective distance.
                     dir_mult = self._direction_score(cx, cy)
-                    effective_dist = dist / dir_mult
+                    # Confidence bonus: higher conf = lower effective distance
+                    conf = d.get("conf", 0.5)
+                    conf_mult = 1.1 - min(conf, 0.9)
+                    # IoU continuity: prefer detections that overlap the
+                    # previous ball box (same physical object frame-to-frame)
+                    iou = bbox_iou(d["box"], self._last_box)
+                    iou_mult = 1.0 + iou * 3.0  # IoU 0.5 → 2.5x bonus
+                    effective_dist = dist * conf_mult / (dir_mult * iou_mult)
                     scored.append((effective_dist, d, cx, cy))
 
             if scored:
                 scored.sort(key=lambda x: x[0])
                 best = scored[0][1]
                 best_cx, best_cy = scored[0][2], scored[0][3]
+
+                # IoU gate: only reject if zero overlap AND very far AND
+                # ball was recently seen (not a long gap where ball moved).
+                # During fast passes, ball can move 200+px with zero overlap,
+                # so only gate when it looks like a completely different object.
+                best_iou = bbox_iou(best["box"], self._last_box)
+                best_dist = math.hypot(best_cx - self._last_cx,
+                                       best_cy - self._last_cy)
+                if (best_iou < 0.01 and best_dist > 250
+                        and self._frames_since <= 2):
+                    return []  # no overlap, far away, ball was just here — skip
             else:
-                # Nothing in search zone — pick largest (new ball / reacquisition)
                 best = max(ball_dets, key=lambda d:
                            (d["box"][2]-d["box"][0]) * (d["box"][3]-d["box"][1]))
                 best_cx = (best["box"][0] + best["box"][2]) / 2.0
@@ -604,7 +620,7 @@ class BallInterpolator:
     Uses a sliding window of BALL_INTERP_BUFFER frames."""
 
     def __init__(self, max_teleport: float):
-        self._buffer: list = []   # list of (frame_image, ball_box_or_None)
+        self._buffer: deque = deque()  # deque of (frame_image, ball_box_or_None)
         self._max_teleport = max_teleport
 
     def push(self, frame: np.ndarray, ball_box: list | None):
@@ -819,7 +835,7 @@ class BallInterpolator:
         # Pop frames that are far enough from the buffer edge
         ready = []
         while len(self._buffer) > half:
-            frame_img, ball_box = self._buffer.pop(0)
+            frame_img, ball_box = self._buffer.popleft()
             ready.append((frame_img, ball_box))
         return ready
 
@@ -828,7 +844,7 @@ class BallInterpolator:
         self._fill_gaps()
         ready = []
         while self._buffer:
-            frame_img, ball_box = self._buffer.pop(0)
+            frame_img, ball_box = self._buffer.popleft()
             ready.append((frame_img, ball_box))
         return ready
 
@@ -1043,7 +1059,7 @@ def run_sahi_ball_targeted(
                 dup = True
                 break
         if not dup:
-            sahi_balls.append({"tid": -1, "box": box, "cls": CLS_BALL})
+            sahi_balls.append({"tid": -1, "box": box, "cls": CLS_BALL, "conf": pred.score.value})
 
     return sahi_balls
 
@@ -1348,9 +1364,62 @@ def finetune(epochs: int = 50, batch: int = 8, imgsz: int = 960):
 
 
 # ---------------------------------------------------------------------------
+# TensorRT export — one-time conversion for faster inference
+# ---------------------------------------------------------------------------
+
+def _trt_engine_path(pt_path: str, imgsz: int) -> Path:
+    """Return the expected TensorRT engine path for a given .pt model."""
+    p = Path(pt_path)
+    return p.parent / f"{p.stem}.engine"
+
+
+def export_tensorrt(weights: str | None = None, imgsz: int = 1280):
+    """Export all pipeline models to TensorRT .engine format.
+    Run once per GPU — engines are hardware-specific."""
+    device = get_device()
+    if not device.startswith("cuda"):
+        print("ERROR: TensorRT export requires a CUDA GPU.")
+        return
+
+    base_dir = Path(__file__).resolve().parent
+    weights_path = weights or str(
+        base_dir / "runs" / "detect" / "train" / "weights" / "best.pt"
+    )
+
+    models_to_export = [
+        (weights_path, "Fine-tuned detection"),
+        ("yolo11n-pose.pt", "Pose estimation"),
+        ("yolo11n.pt", "COCO ball fallback"),
+    ]
+
+    for pt_path, label in models_to_export:
+        engine_path = _trt_engine_path(pt_path, imgsz)
+        if engine_path.exists():
+            print(f"  {label}: {engine_path} already exists, skipping")
+            continue
+        print(f"  Exporting {label}: {pt_path} → TensorRT (imgsz={imgsz}) ...")
+        m = YOLO(pt_path)
+        m.export(format="engine", imgsz=imgsz, half=True, device=0)
+        print(f"  → {engine_path}")
+
+    print("\nTensorRT export complete. Re-run inference to use engines automatically.")
+
+
+def _load_model(pt_path: str, imgsz: int, label: str) -> YOLO:
+    """Load a YOLO model, preferring TensorRT engine if available."""
+    engine_path = _trt_engine_path(pt_path, imgsz)
+    if engine_path.exists():
+        print(f"Loading {label}: {engine_path.name} (TensorRT)")
+        return YOLO(str(engine_path))
+    print(f"Loading {label}: {Path(pt_path).name}")
+    return YOLO(pt_path)
+
+
+# ---------------------------------------------------------------------------
 # Main pipeline
 # ---------------------------------------------------------------------------
 
+@torch.inference_mode()
 def run(video_path: str, out_dir: str, weights: str | None = None,
         use_sahi: bool = True):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
@@ -1368,7 +1437,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
 
     device = get_device()
     if device.startswith("cuda"):
-        infer_imgsz = 1920
+        infer_imgsz = 1280
         use_half    = True
     else:
         infer_imgsz = 640
@@ -1386,15 +1455,9 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
             "Run first: python main.py --finetune"
         )
 
-    print(f"Loading detection model: {Path(weights_path).name} ...")
-    model = YOLO(weights_path)
-
-    print("Loading YOLO11n-pose (skeleton estimation) ...")
-    pose_model = YOLO("yolo11n-pose.pt")
-
-    # COCO pretrained model — secondary ball detector using "sports ball" class
-    print("Loading COCO pretrained model (sports ball fallback) ...")
-    coco_model = YOLO("yolo11s.pt")
+    model      = _load_model(weights_path, infer_imgsz, "detection model")
+    pose_model = _load_model("yolo11n-pose.pt", infer_imgsz, "pose model")
+    coco_model = _load_model("yolo11n.pt", infer_imgsz, "COCO ball fallback")
 
     # SAHI — sliced inference using COCO model for ball detection
     sahi_model = None
@@ -1429,12 +1492,27 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
     )
 
     frame_idx = 0
+    frame_skip = 2       # process every Nth frame (1 = no skip)
+    pose_interval = 3    # run pose every Nth processed frame
+    pose_counter = 0     # counter for processed frames
+    cached_pose_map: dict = {}  # reuse between pose frames
+    last_ball_box = None  # cache ball result for skipped frames
     print("Processing frames ...")
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
+
+        # Skip frames: on non-processed frames, reuse last ball result
+        if frame_idx % frame_skip != 0:
+            ball_interp.push(frame, last_ball_box)
+            for fin_frame, fin_ball_box in ball_interp.pop_ready():
+                if fin_ball_box is not None:
+                    draw_ball(fin_frame, fin_ball_box)
+                out_video.write(fin_frame)
+            frame_idx += 1
+            continue
 
         t_frame_start = time.perf_counter()
 
@@ -1446,7 +1524,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
 
         det_res = model.track(
             frame, persist=True, tracker=tracker_cfg,
-            conf=0.10, iou=0.45,
+            conf=0.10, iou=0.50,
             imgsz=infer_imgsz, device=device, half=use_half,
             verbose=False,
         )[0]
@@ -1471,7 +1549,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                 elif cls_id == CLS_BALL:
                     if conf_val < 0.25:
                         continue
-                    ball_dets.append({"tid": tid, "box": box_list, "cls": CLS_BALL})
+                    ball_dets.append({"tid": tid, "box": box_list, "cls": CLS_BALL, "conf": conf_val})
                 elif cls_id == CLS_HOOP:
                     if conf_val >= 0.30:
                         hoop_dets.append({"tid": tid, "box": box_list, "cls": CLS_HOOP})
@@ -1480,36 +1558,35 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                         ref_dets.append({"tid": tid, "box": box_list, "cls": CLS_REF})
 
         # ---- 1a. COCO pretrained "sports ball" fallback -------------------------
-        # Run COCO model for sports ball class only — supplements fine-tuned dets.
-        coco_res = coco_model.predict(
-            frame, conf=COCO_BALL_CONF, classes=[COCO_BALL_CLS],
-            imgsz=infer_imgsz, device=device, half=use_half,
-            verbose=False,
-        )[0]
-        if coco_res.boxes is not None and len(coco_res.boxes):
-            for box, conf in zip(coco_res.boxes.xyxy, coco_res.boxes.conf):
-                cbox = list(map(int, box.tolist()))
-                # Avoid duplicates: skip if a fine-tuned ball det already overlaps
-                duplicate = False
-                for bd in ball_dets:
-                    ix1 = max(cbox[0], bd["box"][0])
-                    iy1 = max(cbox[1], bd["box"][1])
-                    ix2 = min(cbox[2], bd["box"][2])
-                    iy2 = min(cbox[3], bd["box"][3])
-                    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-                    area_c = (cbox[2]-cbox[0]) * (cbox[3]-cbox[1])
-                    area_b = (bd["box"][2]-bd["box"][0]) * (bd["box"][3]-bd["box"][1])
-                    union = area_c + area_b - inter
-                    if union > 0 and inter / union > 0.3:
-                        duplicate = True
-                        break
-                if not duplicate:
-                    ball_dets.append({"tid": -1, "box": cbox, "cls": CLS_BALL})
+        # Only run COCO model when fine-tuned model didn't find the ball.
+        if not ball_dets:
+            coco_res = coco_model.predict(
+                frame, conf=COCO_BALL_CONF, classes=[COCO_BALL_CLS],
+                imgsz=infer_imgsz, device=device, half=use_half,
+                verbose=False,
+            )[0]
+            if coco_res.boxes is not None and len(coco_res.boxes):
+                for box, conf in zip(coco_res.boxes.xyxy, coco_res.boxes.conf):
+                    cbox = list(map(int, box.tolist()))
+                    duplicate = False
+                    for bd in ball_dets:
+                        ix1 = max(cbox[0], bd["box"][0])
+                        iy1 = max(cbox[1], bd["box"][1])
+                        ix2 = min(cbox[2], bd["box"][2])
+                        iy2 = min(cbox[3], bd["box"][3])
+                        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                        area_c = (cbox[2]-cbox[0]) * (cbox[3]-cbox[1])
+                        area_b = (bd["box"][2]-bd["box"][0]) * (bd["box"][3]-bd["box"][1])
+                        union = area_c + area_b - inter
+                        if union > 0 and inter / union > 0.3:
+                            duplicate = True
+                            break
+                    if not duplicate:
+                        ball_dets.append({"tid": -1, "box": cbox, "cls": CLS_BALL, "conf": float(conf)})
 
         # ---- 1b. SAHI targeted detection around last known ball position ------
-        # Runs every frame (not just when ball is lost) — zoomed-in COCO model
-        # gives the most reliable ball detection once we know the region.
-        if sahi_model is not None:
+        # Only run SAHI when neither fine-tuned nor COCO found the ball.
+        if sahi_model is not None and not ball_dets:
             center = ball_tracker.last_center
             if center is not None and ball_tracker.frames_since_seen < SAHI_MAX_LOST:
                 # COCO SAHI — sports ball class
@@ -1540,7 +1617,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                         bb = pred.bbox
                         box = [int(bb.minx), int(bb.miny),
                                int(bb.maxx), int(bb.maxy)]
-                        ball_dets.append({"tid": -1, "box": box, "cls": CLS_BALL})
+                        ball_dets.append({"tid": -1, "box": box, "cls": CLS_BALL, "conf": pred.score.value})
 
         # ---- 2. Re-ID + memory + velocity ------------------------------------
         raw_dets              = reid_buffer.update(frame_idx, raw_dets)
@@ -1558,17 +1635,21 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         # ---- 3. Jersey OCR (adaptive frequency) --------------------------------
         # Every 10 frames for unconfirmed players, confirmed ones skip inside scan()
         has_unconfirmed = any(jersey_ocr.needs_scan(d["tid"]) for d in real_dets)
-        ocr_interval = 10 if has_unconfirmed else OCR_INTERVAL
+        ocr_interval = 30 if has_unconfirmed else 90
         if frame_idx % ocr_interval == 0:
             jersey_ocr.scan(frame, real_dets)
 
         # ---- 4. Pose estimation (players only, exclude refs) ------------------
-        ref_boxes = [d["box"] for d in ref_dets]
-        pose_res = pose_model.predict(
-            frame, verbose=False, device=device,
-            conf=0.20, imgsz=infer_imgsz, half=use_half,
-        )[0]
-        pose_map = associate_poses(real_dets, ref_boxes, pose_res)
+        # Run pose every pose_interval processed frames; reuse cached result otherwise
+        pose_counter += 1
+        if pose_counter % pose_interval == 0:
+            ref_boxes = [d["box"] for d in ref_dets]
+            pose_res = pose_model.predict(
+                frame, verbose=False, device=device,
+                conf=0.20, imgsz=infer_imgsz, half=use_half,
+            )[0]
+            cached_pose_map = associate_poses(real_dets, ref_boxes, pose_res)
+        pose_map = cached_pose_map
 
         # ---- 5. Ball validation + tracking + Re-ID ----------------------------
         ball_dets    = ball_validator.filter(frame_idx, ball_dets, hoop_dets)
@@ -1601,6 +1682,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         # ---- 7. Buffer frame for ball interpolation --------------------------
         # Ball is NOT drawn yet — the interpolator will fill gaps first.
         ball_box = ball_to_draw[0]["box"] if ball_to_draw else None
+        last_ball_box = ball_box  # cache for skipped frames
         ball_interp.push(frame, ball_box)
 
         # Write finalized frames (interpolator releases them after look-ahead)
@@ -1649,9 +1731,13 @@ if __name__ == "__main__":
     parser.add_argument("--batch",    type=int, default=16)
     parser.add_argument("--no-sahi",  action="store_true",
                         help="Disable SAHI sliced inference for ball detection")
+    parser.add_argument("--export-tensorrt", action="store_true",
+                        help="Export all models to TensorRT .engine format (run once per GPU)")
     args = parser.parse_args()
 
-    if args.finetune:
+    if args.export_tensorrt:
+        export_tensorrt(weights=args.weights)
+    elif args.finetune:
         best_pt = finetune(epochs=args.epochs, batch=args.batch)
         run(args.video, args.out, weights=best_pt, use_sahi=not args.no_sahi)
     else:
