@@ -350,12 +350,4 @@ Two-tier matching when players reappear after going off-camera:
 
 ---
 
-## Team
-
-- Jackson Kennedy
-- Nathan Wan
-- Nathan Todd
-
----
-
 *Last Updated: March 2026*
