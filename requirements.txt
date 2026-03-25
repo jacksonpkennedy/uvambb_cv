@@ -1,5 +1,7 @@
 ultralytics>=8.3.0
 opencv-python>=4.9.0
 numpy>=1.26.0
+# TrackNet ball detection — uses PyTorch (already installed via ultralytics)
+# No additional packages needed; model code is in tracknet.py
 # OpenAI CLIP — required by YOLOE text-prompt encoding (get_text_pe)
 # Must be installed from source: pip install git+https://github.com/openai/CLIP.git
