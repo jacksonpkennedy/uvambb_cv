@@ -26,6 +26,8 @@ from sahi import AutoDetectionModel
 from sahi.predict import get_sliced_prediction
 from ultralytics import YOLO
 
+from tracknet import TrackNetInference
+
 
 # ---------------------------------------------------------------------------
 # Device
@@ -75,7 +77,12 @@ SAHI_SLICE_SIZE    = 128    # smaller slices = more zoom on small ball
 SAHI_OVERLAP_RATIO = 0.35   # more overlap = less chance ball splits across slice edges
 SAHI_MAX_LOST      = 60     # max frames since last ball sighting to run targeted SAHI
 
-# COCO pretrained ball detection — secondary detector for sports ball (class 32)
+# TrackNet — heatmap-based ball detection using 3 consecutive frames
+TRACKNET_WEIGHTS     = "tracknet_basketball.pt"  # path to trained TrackNet weights
+TRACKNET_CONF_THRESH = 0.5                        # heatmap peak confidence threshold
+TRACKNET_BALL_RADIUS = 15                          # pixels, for bbox synthesis from center point
+
+# COCO pretrained ball detection — used by SAHI fallback (class 32)
 COCO_BALL_CLS      = 32     # "sports ball" in COCO
 COCO_BALL_CONF     = 0.20   # confidence threshold for COCO ball detections
 
@@ -473,23 +480,16 @@ class TeamClassifier:
 
 class BallTracker:
     """Track ball detections — pick best detection per frame.
-    Detection-only mode — only returns results when actually detected.
-    Uses velocity + direction history to adaptively size the search zone:
-      - Ball moving fast (pass/shot) → wider search in direction of travel
-      - Ball stationary (held) → tight search zone around last position
+    Simplified for TrackNet: typically 1 detection per frame.
+    When multiple sources (TrackNet + SAHI), picks by confidence.
     Stores last known position so SAHI can target that region."""
 
     _VEL_HISTORY = 5       # frames of velocity history to average
-    _BASE_RADIUS = 80      # minimum search radius in pixels (stationary ball)
-    _VEL_SCALE   = 3.0     # multiply avg speed by this for search radius
-    _MAX_RADIUS  = 500     # cap so we don't accept anything on screen
-    _DIR_BONUS   = 1.5     # extra radius multiplier in the direction of travel
 
     def __init__(self):
         self._last_box: list | None = None
         self._last_seen_frame: int = -999
         self._frames_since: int = 0
-        # Velocity history: list of (vx, vy) in pixels/frame
         self._vel_history: deque = deque(maxlen=self._VEL_HISTORY)
         self._last_cx: float = 0.0
         self._last_cy: float = 0.0
@@ -505,97 +505,16 @@ class BallTracker:
     def frames_since_seen(self) -> int:
         return self._frames_since
 
-    def _avg_velocity(self) -> tuple:
-        """Average velocity (vx, vy) over recent history."""
-        if not self._vel_history:
-            return (0.0, 0.0)
-        vx = sum(v[0] for v in self._vel_history) / len(self._vel_history)
-        vy = sum(v[1] for v in self._vel_history) / len(self._vel_history)
-        return (vx, vy)
-
-    def _search_radius(self) -> float:
-        """Adaptive search radius based on recent ball speed."""
-        vx, vy = self._avg_velocity()
-        speed = math.hypot(vx, vy)
-        radius = self._BASE_RADIUS + speed * self._VEL_SCALE
-        return min(radius, self._MAX_RADIUS)
-
-    def _direction_score(self, det_cx: float, det_cy: float) -> float:
-        """Score a detection by how well it aligns with the ball's travel
-        direction. Returns a multiplier: 1.0 = perpendicular/stationary,
-        up to _DIR_BONUS = in the direction of travel."""
-        vx, vy = self._avg_velocity()
-        speed = math.hypot(vx, vy)
-        if speed < 3.0:
-            # Ball is essentially stationary — direction doesn't matter
-            return 1.0
-        # Vector from last position to detection
-        dx = det_cx - self._last_cx
-        dy = det_cy - self._last_cy
-        det_dist = math.hypot(dx, dy)
-        if det_dist < 1.0:
-            return self._DIR_BONUS  # on top of last position = good
-        # Cosine similarity between velocity direction and detection direction
-        cos_sim = (vx * dx + vy * dy) / (speed * det_dist)
-        # Map from [-1, 1] to [1.0, _DIR_BONUS]: ahead = bonus, behind = 1.0
-        return 1.0 + max(0.0, cos_sim) * (self._DIR_BONUS - 1.0)
-
     def update(self, frame_idx: int, ball_dets: list) -> list:
-        """Return ball detection to draw. No prediction — only real detections.
-        Uses velocity-adaptive search zone + direction preference."""
+        """Return best ball detection. Picks highest confidence."""
         self._frames_since = frame_idx - self._last_seen_frame
         if not ball_dets:
             return []
 
-        if self._last_box is not None:
-            search_r = self._search_radius()
-            # Account for frames since last seen — ball could have traveled further
-            gap = max(1, self._frames_since)
-            search_r = min(search_r * gap, self._MAX_RADIUS)
-
-            scored = []
-            for d in ball_dets:
-                cx = (d["box"][0] + d["box"][2]) / 2.0
-                cy = (d["box"][1] + d["box"][3]) / 2.0
-                dist = math.hypot(cx - self._last_cx, cy - self._last_cy)
-                if dist < search_r:
-                    dir_mult = self._direction_score(cx, cy)
-                    # Confidence bonus: higher conf = lower effective distance
-                    conf = d.get("conf", 0.5)
-                    conf_mult = 1.1 - min(conf, 0.9)
-                    # IoU continuity: prefer detections that overlap the
-                    # previous ball box (same physical object frame-to-frame)
-                    iou = bbox_iou(d["box"], self._last_box)
-                    iou_mult = 1.0 + iou * 3.0  # IoU 0.5 → 2.5x bonus
-                    effective_dist = dist * conf_mult / (dir_mult * iou_mult)
-                    scored.append((effective_dist, d, cx, cy))
-
-            if scored:
-                scored.sort(key=lambda x: x[0])
-                best = scored[0][1]
-                best_cx, best_cy = scored[0][2], scored[0][3]
-
-                # IoU gate: only reject if zero overlap AND very far AND
-                # ball was recently seen (not a long gap where ball moved).
-                # During fast passes, ball can move 200+px with zero overlap,
-                # so only gate when it looks like a completely different object.
-                best_iou = bbox_iou(best["box"], self._last_box)
-                best_dist = math.hypot(best_cx - self._last_cx,
-                                       best_cy - self._last_cy)
-                if (best_iou < 0.01 and best_dist > 250
-                        and self._frames_since <= 2):
-                    return []  # no overlap, far away, ball was just here — skip
-            else:
-                best = max(ball_dets, key=lambda d:
-                           (d["box"][2]-d["box"][0]) * (d["box"][3]-d["box"][1]))
-                best_cx = (best["box"][0] + best["box"][2]) / 2.0
-                best_cy = (best["box"][1] + best["box"][3]) / 2.0
-        else:
-            # First detection ever — pick largest
-            best = max(ball_dets, key=lambda d:
-                       (d["box"][2]-d["box"][0]) * (d["box"][3]-d["box"][1]))
-            best_cx = (best["box"][0] + best["box"][2]) / 2.0
-            best_cy = (best["box"][1] + best["box"][3]) / 2.0
+        # Pick highest confidence detection
+        best = max(ball_dets, key=lambda d: d.get("conf", 0.5))
+        best_cx = (best["box"][0] + best["box"][2]) / 2.0
+        best_cy = (best["box"][1] + best["box"][3]) / 2.0
 
         # Update velocity history
         if self._last_box is not None and self._frames_since <= 3:
@@ -604,7 +523,6 @@ class BallTracker:
             vy = (best_cy - self._last_cy) / gap
             self._vel_history.append((vx, vy))
         elif self._frames_since > 10:
-            # Lost too long — reset velocity history
             self._vel_history.clear()
 
         self._last_box = best["box"]
@@ -849,61 +767,12 @@ class BallInterpolator:
         return ready
 
 
-class BallReID:
-    """Keep the ball's track ID stable across occlusions.
-    When ByteTrack assigns a new tid to the ball after a gap,
-    remap it back to the original tid."""
-
-    def __init__(self):
-        self._canonical_tid: int | None = None   # the "real" ball track ID
-        self._last_center: tuple | None = None
-        self._last_frame: int = -999
-
-    def update(self, frame_idx: int, ball_dets: list) -> list:
-        if not ball_dets:
-            return ball_dets
-
-        for d in ball_dets:
-            tid = d["tid"]
-            if tid == -1:
-                # SAHI detection without a tracker ID — assign canonical
-                if self._canonical_tid is not None:
-                    d["tid"] = self._canonical_tid
-                continue
-
-            cx = (d["box"][0] + d["box"][2]) / 2.0
-            cy = (d["box"][1] + d["box"][3]) / 2.0
-
-            if self._canonical_tid is None:
-                # First ball detection ever
-                self._canonical_tid = tid
-            elif tid != self._canonical_tid:
-                # ByteTrack assigned a new ID — check if it's the same ball
-                gap = frame_idx - self._last_frame
-                if gap <= BALL_REID_BUFFER and self._last_center is not None:
-                    dist = math.hypot(cx - self._last_center[0],
-                                      cy - self._last_center[1])
-                    if dist < BALL_REID_DIST:
-                        d["tid"] = self._canonical_tid
-                    else:
-                        # Too far — accept new track as the ball
-                        self._canonical_tid = tid
-                else:
-                    # Too long since last seen — accept new ID
-                    self._canonical_tid = tid
-
-            self._last_center = (cx, cy)
-            self._last_frame = frame_idx
-
-        return ball_dets
-
-
 # ---------------------------------------------------------------------------
-# Ball Validator — reject false positives (bald heads, off-court, teleports)
+# Ball Validator — reject false positives (off-court, teleports, backboard)
 # ---------------------------------------------------------------------------
 
 class BallValidator:
-    """Validate ball detections: court boundary, teleport rejection, size sanity."""
+    """Validate ball detections: court boundary, teleport rejection, backboard."""
 
     def __init__(self, roi_poly: np.ndarray, frame_w: int, frame_h: int):
         self._roi_poly = roi_poly
@@ -913,10 +782,6 @@ class BallValidator:
         self._last_frame: int = -999
         self._near_hoop_frame: int = -999      # last frame ball was near a hoop
         self._near_hoop_box: list | None = None # the hoop box it was near
-        # Scale thresholds to resolution (constants are for 1080p)
-        scale = (frame_w * frame_h) / (1920 * 1080)
-        self._max_area = BALL_MAX_BBOX_AREA * scale
-        self._min_area = BALL_MIN_BBOX_AREA * scale
         self._max_teleport = BALL_MAX_TELEPORT_PX * (frame_w / 1920.0)
 
     def filter(self, frame_idx: int, ball_dets: list,
@@ -927,26 +792,12 @@ class BallValidator:
             box = d["box"]
             cx = (box[0] + box[2]) / 2.0
             cy = (box[1] + box[3]) / 2.0
-            area = (box[2] - box[0]) * (box[3] - box[1])
 
-            # --- Check 1: Size sanity ---
-            near_hoop = self._near_any_hoop(cx, cy, hoop_dets)
-            max_area = self._max_area * (1.5 if near_hoop else 1.0)
-            if area > max_area or area < self._min_area:
-                continue
-
-            # --- Check 1b: Aspect ratio (ball is ~square) ---
-            w = box[2] - box[0]
-            h = box[3] - box[1]
-            aspect = max(w, h) / max(min(w, h), 1)
-            if aspect > 1.8:
-                continue
-
-            # --- Check 2: Court column ---
+            # --- Check 1: Court column ---
             if not ball_in_court_region(self._roi_poly, cx, cy, self._frame_w):
                 continue
 
-            # --- Check 3: Teleport rejection ---
+            # --- Check 2: Teleport rejection ---
             if self._last_center is not None:
                 gap = frame_idx - self._last_frame
                 if 0 < gap <= BALL_TELEPORT_GRACE:
@@ -955,7 +806,7 @@ class BallValidator:
                     if dist > self._max_teleport * gap:
                         continue
 
-            # --- Check 4: Backboard constraint ---
+            # --- Check 3: Backboard constraint ---
             # If ball was near a hoop recently, reject detections that jump
             # ABOVE the hoop into the crowd. Ball can go past horizontally
             # (airball/bounce) but can't teleport upward into the stands.
@@ -1421,7 +1272,8 @@ def _load_model(pt_path: str, imgsz: int, label: str) -> YOLO:
 
 @torch.inference_mode()
 def run(video_path: str, out_dir: str, weights: str | None = None,
-        use_sahi: bool = True):
+        use_sahi: bool = True, use_tracknet: bool = True,
+        tracknet_weights: str | None = None):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     cap = cv2.VideoCapture(video_path)
@@ -1457,9 +1309,18 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
 
     model      = _load_model(weights_path, infer_imgsz, "detection model")
     pose_model = _load_model("yolo11n-pose.pt", infer_imgsz, "pose model")
-    coco_model = _load_model("yolo11n.pt", infer_imgsz, "COCO ball fallback")
 
-    # SAHI — sliced inference using COCO model for ball detection
+    # TrackNet — primary ball detector (heatmap regression on 3 consecutive frames)
+    tracknet_model = None
+    if use_tracknet:
+        tn_weights = tracknet_weights or TRACKNET_WEIGHTS
+        tracknet_model = TrackNetInference(
+            tn_weights, device=device,
+            conf_thresh=TRACKNET_CONF_THRESH,
+            ball_radius=TRACKNET_BALL_RADIUS,
+        )
+
+    # SAHI — sliced inference fallback for ball detection
     sahi_model = None
     if use_sahi:
         print("Loading SAHI sliced-inference model (COCO sports ball) ...")
@@ -1480,8 +1341,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
     print("Loading EasyOCR (jersey number reader) ...")
     jersey_ocr    = JerseyOCR()
     reid_buffer.set_jersey_ocr(jersey_ocr)
-    ball_tracker  = BallTracker()
-    ball_reid     = BallReID()
+    ball_tracker   = BallTracker()
     ball_validator = BallValidator(roi_poly, frame_w, frame_h)
     team_clf      = TeamClassifier()
     ball_interp   = BallInterpolator(max_teleport=BALL_MAX_TELEPORT_PX * (frame_w / 1920.0))
@@ -1495,8 +1355,13 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
     frame_skip = 2       # process every Nth frame (1 = no skip)
     pose_interval = 3    # run pose every Nth processed frame
     pose_counter = 0     # counter for processed frames
-    cached_pose_map: dict = {}  # reuse between pose frames
     last_ball_box = None  # cache ball result for skipped frames
+    # Cache last-processed-frame annotations so skipped frames aren't bare
+    cached_real_dets: list = []
+    cached_ghost_dets: list = []
+    cached_hoop_dets: list = []
+    cached_ref_dets: list = []
+    cached_pose_map: dict = {}
     print("Processing frames ...")
 
     while True:
@@ -1504,9 +1369,37 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         if not ret:
             break
 
-        # Skip frames: on non-processed frames, reuse last ball result
+        # Skip frames: on non-processed frames, still run TrackNet (needs
+        # every frame for its 3-frame sliding window) but skip YOLO/pose/OCR.
+        # Redraw cached annotations so the output doesn't flicker.
         if frame_idx % frame_skip != 0:
-            ball_interp.push(frame, last_ball_box)
+            tracknet_ball_box = None
+            if tracknet_model is not None:
+                tn_det = tracknet_model.predict(frame)
+                if tn_det is not None:
+                    tracknet_ball_box = tn_det["box"]
+
+            # Redraw all non-ball annotations from the last processed frame
+            for det in cached_hoop_dets:
+                draw_hoop(frame, det["box"])
+            for det in cached_ref_dets:
+                draw_ref(frame, det["box"], det["tid"])
+            for d in cached_real_dets:
+                tid = d["tid"]
+                jersey = jersey_ocr.get_jersey(tid)
+                label = f"#{jersey}" if jersey else f"#{tid}"
+                team_color = team_clf.get_team_color(tid)
+                draw_player(frame, d["box"], label, color=team_color)
+                if tid in cached_pose_map:
+                    draw_skeleton(frame, *cached_pose_map[tid])
+            for d in cached_ghost_dets:
+                tid = d["tid"]
+                jersey = jersey_ocr.get_jersey(tid)
+                label = f"#{jersey}" if jersey else f"#{tid}"
+                team_color = team_clf.get_team_color(tid)
+                draw_player(frame, d["box"], label, color=team_color)
+
+            ball_interp.push(frame, tracknet_ball_box if tracknet_ball_box else last_ball_box)
             for fin_frame, fin_ball_box in ball_interp.pop_ready():
                 if fin_ball_box is not None:
                     draw_ball(fin_frame, fin_ball_box)
@@ -1521,6 +1414,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         ball_dets      = []
         hoop_dets      = []
         ref_dets       = []
+        ball_source    = "none"
 
         det_res = model.track(
             frame, persist=True, tracker=tracker_cfg,
@@ -1546,10 +1440,6 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                     if not in_court_roi(roi_poly, box_list):
                         continue
                     raw_dets.append({"tid": tid, "box": box_list, "label": LABEL_PLAYER})
-                elif cls_id == CLS_BALL:
-                    if conf_val < 0.25:
-                        continue
-                    ball_dets.append({"tid": tid, "box": box_list, "cls": CLS_BALL, "conf": conf_val})
                 elif cls_id == CLS_HOOP:
                     if conf_val >= 0.30:
                         hoop_dets.append({"tid": tid, "box": box_list, "cls": CLS_HOOP})
@@ -1557,35 +1447,16 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                     if conf_val >= 0.30:
                         ref_dets.append({"tid": tid, "box": box_list, "cls": CLS_REF})
 
-        # ---- 1a. COCO pretrained "sports ball" fallback -------------------------
-        # Only run COCO model when fine-tuned model didn't find the ball.
-        if not ball_dets:
-            coco_res = coco_model.predict(
-                frame, conf=COCO_BALL_CONF, classes=[COCO_BALL_CLS],
-                imgsz=infer_imgsz, device=device, half=use_half,
-                verbose=False,
-            )[0]
-            if coco_res.boxes is not None and len(coco_res.boxes):
-                for box, conf in zip(coco_res.boxes.xyxy, coco_res.boxes.conf):
-                    cbox = list(map(int, box.tolist()))
-                    duplicate = False
-                    for bd in ball_dets:
-                        ix1 = max(cbox[0], bd["box"][0])
-                        iy1 = max(cbox[1], bd["box"][1])
-                        ix2 = min(cbox[2], bd["box"][2])
-                        iy2 = min(cbox[3], bd["box"][3])
-                        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-                        area_c = (cbox[2]-cbox[0]) * (cbox[3]-cbox[1])
-                        area_b = (bd["box"][2]-bd["box"][0]) * (bd["box"][3]-bd["box"][1])
-                        union = area_c + area_b - inter
-                        if union > 0 and inter / union > 0.3:
-                            duplicate = True
-                            break
-                    if not duplicate:
-                        ball_dets.append({"tid": -1, "box": cbox, "cls": CLS_BALL, "conf": float(conf)})
+        # ---- 1a. TrackNet primary ball detection --------------------------------
+        # TrackNet uses 3 consecutive frames (temporal context) for heatmap
+        # regression — much better at small, fast-moving balls than YOLO.
+        if tracknet_model is not None:
+            tn_det = tracknet_model.predict(frame)
+            if tn_det is not None:
+                ball_dets.append(tn_det)
+                ball_source = "TrackNet"
 
-        # ---- 1b. SAHI targeted detection around last known ball position ------
-        # Only run SAHI when neither fine-tuned nor COCO found the ball.
+        # ---- 1b. SAHI fallback — when TrackNet misses the ball ----------------
         if sahi_model is not None and not ball_dets:
             center = ball_tracker.last_center
             if center is not None and ball_tracker.frames_since_seen < SAHI_MAX_LOST:
@@ -1618,6 +1489,8 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                         box = [int(bb.minx), int(bb.miny),
                                int(bb.maxx), int(bb.maxy)]
                         ball_dets.append({"tid": -1, "box": box, "cls": CLS_BALL, "conf": pred.score.value})
+            if ball_dets:
+                ball_source = "SAHI"
 
         # ---- 2. Re-ID + memory + velocity ------------------------------------
         raw_dets              = reid_buffer.update(frame_idx, raw_dets)
@@ -1651,9 +1524,8 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
             cached_pose_map = associate_poses(real_dets, ref_boxes, pose_res)
         pose_map = cached_pose_map
 
-        # ---- 5. Ball validation + tracking + Re-ID ----------------------------
+        # ---- 5. Ball validation + tracking ------------------------------------
         ball_dets    = ball_validator.filter(frame_idx, ball_dets, hoop_dets)
-        ball_dets    = ball_reid.update(frame_idx, ball_dets)
         ball_to_draw = ball_tracker.update(frame_idx, ball_dets)
 
         # ---- 6. Draw hoop / ref / players (everything except ball) ------------
@@ -1679,6 +1551,13 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
             if tid in pose_map:
                 draw_skeleton(frame, *pose_map[tid])
 
+        # Cache annotations for skipped frames (prevents flicker)
+        cached_real_dets = real_dets
+        cached_ghost_dets = ghost_dets
+        cached_hoop_dets = hoop_dets
+        cached_ref_dets = ref_dets
+        cached_pose_map = pose_map
+
         # ---- 7. Buffer frame for ball interpolation --------------------------
         # Ball is NOT drawn yet — the interpolator will fill gaps first.
         ball_box = ball_to_draw[0]["box"] if ball_to_draw else None
@@ -1701,7 +1580,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                   f"| players={len(real_dets)}  "
                   f"| jerseys={n_jerseys}  "
                   f"| poses={len(pose_map)}  "
-                  f"| ball={'YES' if ball_to_draw else 'no'}")
+                  f"| ball={ball_source if ball_to_draw else 'no'}")
 
     # Flush remaining buffered frames
     for fin_frame, fin_ball_box in ball_interp.flush():
@@ -1731,14 +1610,42 @@ if __name__ == "__main__":
     parser.add_argument("--batch",    type=int, default=16)
     parser.add_argument("--no-sahi",  action="store_true",
                         help="Disable SAHI sliced inference for ball detection")
+    parser.add_argument("--no-tracknet", action="store_true",
+                        help="Disable TrackNet ball detection (fall back to SAHI only)")
+    parser.add_argument("--tracknet-weights", default=None,
+                        help="Path to TrackNet weights (default: tracknet_basketball.pt)")
+    parser.add_argument("--finetune-tracknet", action="store_true",
+                        help="Train TrackNet then run inference")
+    parser.add_argument("--tracknet-data", type=str, default=None,
+                        help="TrackNet label directory (default: auto-converts YOLO labels)")
     parser.add_argument("--export-tensorrt", action="store_true",
                         help="Export all models to TensorRT .engine format (run once per GPU)")
     args = parser.parse_args()
 
+    run_kwargs = dict(
+        use_sahi=not args.no_sahi,
+        use_tracknet=not args.no_tracknet,
+        tracknet_weights=args.tracknet_weights,
+    )
+
     if args.export_tensorrt:
         export_tensorrt(weights=args.weights)
+    elif args.finetune_tracknet:
+        from tracknet import train_tracknet
+        if args.tracknet_data:
+            tn_data_dir = args.tracknet_data
+        else:
+            from convert_labels import convert
+            print("Converting YOLO labels → TrackNet format ...")
+            convert("data/custom_annotations", "data/tracknet_labels")
+            tn_data_dir = "data/tracknet_labels"
+        print(f"\nTraining TrackNet on {tn_data_dir} ...")
+        tn_best = train_tracknet(tn_data_dir,
+                                 epochs=args.epochs, batch_size=args.batch)
+        run_kwargs["tracknet_weights"] = tn_best
+        run(args.video, args.out, weights=args.weights, **run_kwargs)
     elif args.finetune:
         best_pt = finetune(epochs=args.epochs, batch=args.batch)
-        run(args.video, args.out, weights=best_pt, use_sahi=not args.no_sahi)
+        run(args.video, args.out, weights=best_pt, **run_kwargs)
     else:
-        run(args.video, args.out, weights=args.weights, use_sahi=not args.no_sahi)
+        run(args.video, args.out, weights=args.weights, **run_kwargs)
