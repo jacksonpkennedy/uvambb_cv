@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A basketball analysis pipeline that detects, tracks, and annotates players, referees, the basketball, and the hoop from game footage using a fine-tuned YOLO11s model with ByteTrack multi-object tracking, pose estimation, jersey number OCR, SAHI-enhanced ball detection, temporal interpolation with outlier rejection, and automatic team classification.
+A basketball analysis pipeline that detects, tracks, and annotates players, referees, the basketball, and the hoop from game footage using a fine-tuned YOLO11s model with ByteTrack multi-object tracking, TrackNet heatmap-based ball detection, pose estimation, jersey number OCR, SAHI-enhanced ball recovery, temporal interpolation with outlier rejection, and automatic team classification.
 
 **Team Members:**
 - Jackson Kennedy
@@ -27,51 +27,65 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
                               │  (skipped frames reuse results) │
                               └───────────────┬─────────────────┘
                                               │
-                 ┌────────────────────────────┼────────────────────────────┐
-                 │                            │                            │
-    ┌────────────▼────────────┐  ┌────────────▼────────────┐  ┌───────────▼───────────┐
-    │   FINE-TUNED YOLO11s    │  │   COCO FALLBACK (11n)   │  │   SAHI SLICED INFER   │
-    │   Detection + Tracking  │  │   "sports ball" cls 32  │  │   Targeted 128px crop │
-    │   4 classes + ByteTrack │  │   Only if no ball found │  │   Only if still no    │
-    │                         │  │                         │  │   ball after COCO     │
-    │   Players, Refs, Hoops  │  │   Ball candidates       │  │   Ball candidates     │
-    └────────┬────────────────┘  └────────────┬────────────┘  └───────────┬───────────┘
-             │                                │                           │
-             └────────────────────────────────┼───────────────────────────┘
-                                              │
-                              ┌───────────────▼─────────────────┐
-                              │       BALL VALIDATION           │
-                              │  Size → Aspect → Court region   │
-                              │  → Teleport → Backboard         │
-                              └───────────────┬─────────────────┘
-                                              │
-                 ┌────────────────────────────┼────────────────────────────┐
-                 │                            │                            │
-    ┌────────────▼────────────┐  ┌────────────▼────────────┐  ┌───────────▼───────────┐
-    │   PLAYER PROCESSING     │  │   BALL TRACKING          │  │   POSE ESTIMATION     │
-    │                         │  │                          │  │                       │
-    │  Re-ID (jersey + prox)  │  │  BallTracker (velocity)  │  │   YOLO11n-pose        │
-    │  Jersey OCR (EasyOCR)   │  │  BallReID (stable IDs)   │  │   Every 3rd processed │
-    │  Team classify (K-means)│  │  BallInterpolator (gaps)  │  │   frame, cached       │
-    │  Velocity tracker       │  │                          │  │                       │
-    └────────┬────────────────┘  └────────────┬────────────┘  └───────────┬───────────┘
-             │                                │                           │
-             └────────────────────────────────┼───────────────────────────┘
-                                              │
-                              ┌───────────────▼─────────────────┐
+          ┌───────────────────────────────────┼──────────────────────┐
+          │                                   │                      │
+   ┌──────▼──────────────┐      ┌─────────────▼──────────────┐      │
+   │  FINE-TUNED YOLO11s │      │     TRACKNET (PRIMARY)     │      │
+   │  Detection+Tracking │      │  3-frame heatmap regression │      │
+   │  4 cls + ByteTrack  │      │  Runs EVERY frame (even     │      │
+   │                     │      │  skipped) for sliding window │      │
+   │  Players, Refs,     │      │                             │      │
+   │  Hoops              │      │  Ball center + confidence   │      │
+   └──────┬──────────────┘      └─────────────┬──────────────┘      │
+          │                                   │                      │
+          │                        ball found? │                      │
+          │                   YES ◄────────────┤                      │
+          │                    │               NO                     │
+          │                    │               │                      │
+          │                    │    ┌──────────▼───────────┐          │
+          │                    │    │  SAHI SLICED INFER   │          │
+          │                    │    │  Targeted 128px crop │          │
+          │                    │    │  Full-frame fallback │          │
+          │                    │    │  if lost >60 frames  │          │
+          │                    │    └──────────┬───────────┘          │
+          │                    │               │                      │
+          │                    └───────┬───────┘                      │
+          │                            │                              │
+          │             ┌──────────────▼───────────────┐              │
+          │             │       BALL VALIDATION        │              │
+          │             │  Court region → Teleport     │              │
+          │             │  → Backboard constraint      │              │
+          │             └──────────────┬───────────────┘              │
+          │                            │                              │
+          └────────────────────────────┼──────────────────────────────┘
+                                       │
+          ┌────────────────────────────┼──────────────────────────────┐
+          │                            │                              │
+   ┌──────▼──────────────┐  ┌─────────▼────────────┐  ┌─────────────▼──────────┐
+   │  PLAYER PROCESSING  │  │    BALL TRACKING     │  │   POSE ESTIMATION      │
+   │                     │  │                      │  │                        │
+   │  Re-ID (jersey+prox)│  │  BallTracker (vel)   │  │   YOLO11n-pose         │
+   │  Jersey OCR         │  │  BallInterpolator    │  │   Every 3rd processed  │
+   │  Team classify      │  │  (gap filling)       │  │   frame, cached        │
+   │  Velocity tracker   │  │                      │  │                        │
+   └──────┬──────────────┘  └─────────┬────────────┘  └─────────────┬──────────┘
+          │                            │                              │
+          └────────────────────────────┼──────────────────────────────┘
+                                       │
+                              ┌────────▼────────────────────────┐
                               │         ANNOTATION              │
                               │  Draw boxes, skeletons, labels  │
                               │  Team colors, jersey numbers    │
-                              └───────────────┬─────────────────┘
-                                              │
-                              ┌───────────────▼─────────────────┐
+                              └────────┬────────────────────────┘
+                                       │
+                              ┌────────▼────────────────────────┐
                               │      INTERPOLATION BUFFER       │
                               │  20-frame look-ahead            │
                               │  Outlier rejection (1-3 spikes) │
                               │  Linear + arc gap filling       │
-                              └───────────────┬─────────────────┘
-                                              │
-                              ┌───────────────▼─────────────────┐
+                              └────────┬────────────────────────┘
+                                       │
+                              ┌────────▼────────────────────────┐
                               │        VIDEO OUTPUT             │
                               │   Annotated MP4 @ original fps  │
                               └─────────────────────────────────┘
@@ -81,15 +95,15 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
 
 | Component | Implementation | Details |
 |---|---|---|
-| Detection | YOLO11s (fine-tuned) + COCO pretrained | Fine-tuned for players/hoop/ref, COCO "sports ball" (class 32) as conditional fallback |
+| Detection | YOLO11s (fine-tuned) | Fine-tuned for players/hoop/ref (4 classes) |
 | Tracking | ByteTrack | Custom config — 4s track buffer, low thresholds for ball |
+| Ball Detection | TrackNet (primary) | Encoder-decoder heatmap regression on 3 consecutive frames — temporal context for small, fast-moving ball |
+| Ball Recovery | SAHI (COCO model) | Fallback when TrackNet misses — targeted sliced inference + full-frame scan |
+| Ball Validation | BallValidator | Court region, teleport rejection, backboard constraint |
+| Ball Interpolation | BallInterpolator | 20-frame look-ahead buffer, relative outlier rejection (1-3 frame spikes), linear + parabolic gap filling |
+| Ball Tracker | BallTracker | Picks highest-confidence detection, maintains velocity history and last known position |
 | Pose Estimation | YOLO11n-pose | 17-point COCO skeleton, every 3rd processed frame (cached) |
 | Jersey OCR | EasyOCR | Adaptive frequency (every 30 frames unconfirmed, 90 confirmed), majority voting |
-| Ball Recovery | SAHI (COCO model) | Conditional — only when primary + COCO both miss, targeted crop + full-frame fallback |
-| Ball Validation | BallValidator | 5-layer filter: size, aspect ratio, court region, teleport rejection, backboard constraint |
-| Ball Interpolation | BallInterpolator | 20-frame look-ahead buffer, relative outlier rejection (1-3 frame spikes), linear + parabolic gap filling |
-| Ball Tracker | BallTracker | Velocity-adaptive search zone with direction preference (5-frame history, 80-500px radius) |
-| Ball Re-ID | BallReID | Keeps ball track ID stable across occlusions (4s buffer, 500px radius) |
 | Player Re-ID | TemporalReIDBuffer | Jersey-based matching (ignores distance) + proximity fallback (300px), 10s memory |
 | Velocity Tracker | VelocityTracker | Preserves player IDs through overlapping bounding boxes |
 | Team Classification | TeamClassifier | K-means (k=2) on HSV jersey color histograms, auto-detects home vs away |
@@ -110,7 +124,11 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
 ```
 uvambb_cv/
 ├── main.py                          # Full pipeline — fine-tuning + inference
+├── tracknet.py                      # TrackNet model — encoder-decoder heatmap ball detection
+├── auto_label_tracknet.py           # Auto-label video frames for TrackNet training (YOLO + SAHI)
+├── convert_labels.py                # Convert YOLO annotations → TrackNet CSV format
 ├── bytetrack_players.yaml           # ByteTrack tracker config
+├── requirements.txt                 # Python dependencies
 ├── data/
 │   ├── custom_annotations/          # Roboflow export (YOLOv11 format)
 │   │   ├── data.yaml                # Dataset config (nc=4, class names)
@@ -120,13 +138,22 @@ uvambb_cv/
 │   │   └── valid/                   # 97 validation images + labels (80/20 split)
 │   │       ├── images/
 │   │       └── labels/
+│   ├── tracknet_autolabels/         # Auto-labeled frames for TrackNet
+│   │   ├── frames/                  # Extracted game frames (game_01/, game_02/)
+│   │   ├── train.csv                # TrackNet training labels (after --relabel)
+│   │   └── val.csv                  # TrackNet validation labels
+│   ├── tracknet_labels/             # Converted YOLO → TrackNet labels (from Roboflow data)
 │   ├── frames/                      # Extracted frames from game 1
 │   ├── frames2/                     # Extracted frames from game 2 (first 20 min, every 15th frame)
 │   └── game_01.mp4                  # Game footage
-├── runs/detect/train/weights/       # Fine-tuned model weights
-│   ├── best.pt                      # Best val mAP checkpoint
-│   ├── best.engine                  # TensorRT engine (after --export-tensorrt)
-│   └── last.pt                      # Latest epoch checkpoint
+├── runs/
+│   ├── detect/train/weights/        # Fine-tuned YOLO weights
+│   │   ├── best.pt                  # Best val mAP checkpoint
+│   │   ├── best.engine              # TensorRT engine (after --export-tensorrt)
+│   │   └── last.pt                  # Latest epoch checkpoint
+│   └── tracknet/weights/            # TrackNet trained weights
+│       ├── best.pt                  # Best val loss checkpoint
+│       └── last.pt                  # Latest epoch checkpoint
 └── output/
     └── annotated.mp4                # Annotated output video
 ```
@@ -171,6 +198,20 @@ python main.py --video data/game_01.mp4 [--weights path/to/best.pt]
 
 Automatically loads `runs/detect/train/weights/best.pt` if no weights specified.
 
+### Train TrackNet (ball detection)
+
+```bash
+# Option 1: Auto-label frames from video, then train
+python auto_label_tracknet.py --video data/game_01.mp4 data/game_02.mp4 --max-frames 3000
+python main.py --finetune-tracknet --tracknet-data data/tracknet_autolabels
+
+# Option 2: Re-label existing extracted frames (if auto-label was interrupted)
+python auto_label_tracknet.py --relabel
+python main.py --finetune-tracknet --tracknet-data data/tracknet_autolabels
+```
+
+TrackNet uses 3 consecutive frames (9-channel input) to predict a heatmap of the ball location — temporal context makes it far better than single-frame YOLO at detecting small, fast-moving, motion-blurred balls.
+
 ### Export to TensorRT (2-3x faster inference)
 
 ```bash
@@ -179,10 +220,11 @@ python main.py --export-tensorrt [--weights path/to/best.pt]
 
 One-time export — engines are GPU-specific and auto-loaded on subsequent runs.
 
-### Disable SAHI (faster, less ball detection)
+### Disable TrackNet or SAHI
 
 ```bash
-python main.py --video data/game_01.mp4 --no-sahi
+python main.py --video data/game_01.mp4 --no-tracknet   # fall back to SAHI only
+python main.py --video data/game_01.mp4 --no-sahi        # disable SAHI fallback
 ```
 
 ### Resume training from checkpoint
@@ -215,6 +257,18 @@ Aggressive color augmentation to force shape-based learning over color shortcuts
 - **HSV jitter**: h=0.15, s=0.7, v=0.4 — strong hue/saturation shifts prevent the model from relying on "orange = basketball" and force it to learn the round shape and seam texture
 - **Geometric**: mosaic, mixup (0.15), copy-paste (0.3), random erasing (0.4), rotation (10°), translation, scale, shear, perspective warp, horizontal flip
 - **No Roboflow augmentation** — YOLO's on-the-fly augmentation generates infinite variations per epoch vs. a fixed augmented set
+
+### TrackNet Training
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| Architecture | Encoder-decoder CNN (VGG-style) | 9-ch input (3 stacked RGB frames) → 1-ch sigmoid heatmap |
+| Input resolution | 640x360 | TrackNet canonical size, fast inference |
+| Target | 2D Gaussian heatmap (sigma=5) | Ball center as soft probability map |
+| Loss | Weighted BCE (pos_weight=20) | Ball pixels are <0.01% of image — upweighting prevents all-zeros |
+| Optimizer | Adam, lr=1e-3 | Standard for heatmap regression |
+| Post-processing | Threshold + Hough circle detection | Falls back to argmax if Hough fails but confidence is high |
+| Training data | ~5,960 auto-labeled frames | YOLO + SAHI detections on game_01 and game_02 |
 
 ---
 
@@ -263,29 +317,26 @@ The pipeline is optimized to process a full 2-hour game (432K frames at 60fps) w
 The basketball is the hardest object to detect (small, fast-moving, similar color to shoes and skin). The pipeline uses a cascading approach — each stage only fires when the previous one fails:
 
 ```
-  Fine-tuned YOLO11s          ← runs every processed frame
+  TrackNet (3-frame heatmap)   ← runs EVERY frame (needs sequential sliding window)
         │
         ├── ball found? ──YES──→ skip to BallValidator
         │
         NO
         │
-  COCO "sports ball" (11n)   ← only when fine-tuned misses
-        │
-        ├── ball found? ──YES──→ skip to BallValidator
-        │
-        NO
-        │
-  SAHI sliced inference      ← only when both miss
+  SAHI sliced inference        ← only when TrackNet misses
         │
         ├── targeted crop (if last position known)
         └── full-frame scan (if ball lost >60 frames, every 5th frame)
 ```
 
+### Why TrackNet over YOLO for ball detection
+
+YOLO sees one frame at a time — the ball is ~15-25px with motion blur, often indistinguishable from shoes, bald heads, and court markings in a single frame. TrackNet stacks 3 consecutive frames (9-channel input) and learns *motion patterns*: a blurry streak across 3 frames is a strong signal even when a single frame is ambiguous. It outputs a heatmap (probability per pixel) rather than a bounding box, which is better suited for localizing a single small point.
+
 ### Detection Sources
-1. **Fine-tuned model** — detects ball at conf >= 0.25 (BallValidator catches false positives)
-2. **COCO pretrained model** — `yolo11n.pt` "sports ball" class (32) at conf >= 0.20, only when fine-tuned model finds no ball
-3. **SAHI targeted** — 128px sliced inference around last known position, only when both primary detectors miss
-4. **SAHI full-frame** — when ball lost >60 frames, scans entire frame every 5th frame to re-acquire
+1. **TrackNet (primary)** — heatmap regression on 3 consecutive frames, conf >= 0.5, runs every frame including skipped ones (sliding window must stay in sync)
+2. **SAHI targeted** — 128px sliced inference around last known position using COCO model, only when TrackNet misses
+3. **SAHI full-frame** — when ball lost >60 frames, scans entire frame every 5th frame to re-acquire
 
 ### Validation (BallValidator)
 Rejects false positives with 5 checks in order:

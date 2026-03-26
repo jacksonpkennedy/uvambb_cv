@@ -287,9 +287,8 @@ def train_tracknet(data_dir: str, epochs: int = 30, batch_size: int = 4,
 
     model = TrackNetV3().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    # Weighted BCE: ball pixels are rare, so weight positives higher
+    # Weighted BCE: ball pixels are rare (~0.01% of image), so weight positives higher
     pos_weight = torch.tensor([20.0], device=device)
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     best_val_loss = float("inf")
 
@@ -302,9 +301,13 @@ def train_tracknet(data_dir: str, epochs: int = 30, batch_size: int = 4,
             target = target.to(device)          # (B, 1, H, W) float32
 
             out = model(inp)                    # (B, 1, H, W) sigmoid
-            # BCEWithLogitsLoss needs pre-sigmoid logits, but our model
-            # already applies sigmoid. Use plain BCE instead.
-            loss = nn.functional.binary_cross_entropy(out, target)
+            # Weighted BCE: upweight ball pixels (pos_weight=20) since
+            # they're <0.01% of the heatmap. Without this, model learns
+            # to predict all-zeros.
+            loss = nn.functional.binary_cross_entropy(
+                out, target,
+                weight=torch.where(target > 0.5, pos_weight, torch.ones(1, device=device))
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -329,7 +332,10 @@ def train_tracknet(data_dir: str, epochs: int = 30, batch_size: int = 4,
                     inp = inp.to(device)
                     target = target.to(device)
                     out = model(inp)
-                    loss = nn.functional.binary_cross_entropy(out, target)
+                    loss = nn.functional.binary_cross_entropy(
+                        out, target,
+                        weight=torch.where(target > 0.5, pos_weight, torch.ones(1, device=device))
+                    )
                     val_loss += loss.item()
             avg_val = val_loss / max(len(val_loader), 1)
 
