@@ -78,7 +78,7 @@ SAHI_OVERLAP_RATIO = 0.35   # more overlap = less chance ball splits across slic
 SAHI_MAX_LOST      = 60     # max frames since last ball sighting to run targeted SAHI
 
 # TrackNet — heatmap-based ball detection using 3 consecutive frames
-TRACKNET_WEIGHTS     = "tracknet_basketball.pt"  # path to trained TrackNet weights
+TRACKNET_WEIGHTS     = "runs/tracknet/weights/best.pt"  # path to trained TrackNet weights
 TRACKNET_CONF_THRESH = 0.5                        # heatmap peak confidence threshold
 TRACKNET_BALL_RADIUS = 15                          # pixels, for bbox synthesis from center point
 

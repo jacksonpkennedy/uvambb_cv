@@ -262,11 +262,98 @@ def write_csvs(all_labels: list, output_dir: str, val_split: float = 0.15):
               f"{detected} with ball → {csv_path}")
 
 
+@torch.inference_mode()
+def relabel_existing_frames(frames_dir: str, output_dir: str,
+                            weights: str, conf_thresh: float = 0.15):
+    """Re-run ball detection on already-extracted frame images to generate CSVs.
+    Use this when auto_label_video was interrupted and frames exist but CSVs don't."""
+    frames_path = Path(frames_dir)
+    if not frames_path.exists():
+        raise FileNotFoundError(f"Frames directory not found: {frames_dir}")
+
+    # Discover all game subdirectories
+    game_dirs = sorted([d for d in frames_path.iterdir() if d.is_dir()])
+    if not game_dirs:
+        raise FileNotFoundError(f"No game subdirectories found in {frames_dir}")
+
+    device = get_device()
+    infer_imgsz = 1280 if device.startswith("cuda") else 640
+    use_half = device.startswith("cuda")
+
+    print("Loading fine-tuned YOLO model ...")
+    model = YOLO(weights)
+    model.to(device)
+
+    print("Loading SAHI model (COCO sports ball) ...")
+    sahi_model = AutoDetectionModel.from_pretrained(
+        model_type="yolov8",
+        model_path="yolo11s.pt",
+        confidence_threshold=SAHI_CONF_THRESH,
+        device=device,
+    )
+
+    all_labels = []
+
+    for game_dir in game_dirs:
+        frame_files = sorted(game_dir.glob("frame_*.jpg"))
+        if not frame_files:
+            print(f"Skipping {game_dir.name}: no frames found")
+            continue
+
+        print(f"\n{game_dir.name}: {len(frame_files)} frames")
+
+        # Read first frame for dimensions
+        sample = cv2.imread(str(frame_files[0]))
+        frame_h, frame_w = sample.shape[:2]
+        roi_poly = build_court_roi(frame_w, frame_h)
+
+        last_center = None
+        frames_since_seen = 999
+        detected_count = 0
+
+        for i, frame_file in enumerate(frame_files):
+            frame = cv2.imread(str(frame_file))
+            if frame is None:
+                all_labels.append((str(frame_file), 0, -1, -1))
+                frames_since_seen += 1
+                continue
+
+            result = detect_ball_frame(
+                model, sahi_model, frame, roi_poly,
+                frame_w, frame_h, device, infer_imgsz, use_half,
+                last_center, frames_since_seen,
+            )
+
+            if result is not None and result[2] >= conf_thresh:
+                cx, cy, conf = result
+                all_labels.append((str(frame_file), 1, round(cx, 1), round(cy, 1)))
+                last_center = (cx, cy)
+                frames_since_seen = 0
+                detected_count += 1
+            else:
+                all_labels.append((str(frame_file), 0, -1, -1))
+                frames_since_seen += 1
+
+            if (i + 1) % 200 == 0 or i == 0:
+                pct = detected_count / (i + 1) * 100
+                print(f"  frame {i+1}/{len(frame_files)}  |  "
+                      f"detected: {detected_count}/{i+1} ({pct:.0f}%)")
+
+        pct = detected_count / max(len(frame_files), 1) * 100
+        print(f"  {game_dir.name}: {detected_count}/{len(frame_files)} "
+              f"with ball ({pct:.0f}%)")
+
+    return all_labels
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Auto-label video frames for TrackNet training")
-    parser.add_argument("--video", nargs="+", required=True,
+    parser.add_argument("--video", nargs="*", default=None,
                         help="Path(s) to game video(s)")
+    parser.add_argument("--relabel", action="store_true",
+                        help="Re-run detection on existing extracted frames "
+                             "(use when previous run was interrupted)")
     parser.add_argument("--weights", type=str,
                         default="runs/detect/train/weights/best.pt",
                         help="Fine-tuned YOLO weights")
@@ -281,17 +368,27 @@ def main():
                         help="Output directory for frames and CSVs")
     args = parser.parse_args()
 
-    all_labels = []
-    for video in args.video:
-        labels = auto_label_video(
-            video, args.output_dir, args.weights,
-            max_frames=args.max_frames,
+    if args.relabel:
+        frames_dir = str(Path(args.output_dir) / "frames")
+        all_labels = relabel_existing_frames(
+            frames_dir, args.output_dir, args.weights,
             conf_thresh=args.conf_thresh,
-            start_frame=args.start_frame,
         )
-        all_labels.extend(labels)
+    elif args.video:
+        all_labels = []
+        for video in args.video:
+            labels = auto_label_video(
+                video, args.output_dir, args.weights,
+                max_frames=args.max_frames,
+                conf_thresh=args.conf_thresh,
+                start_frame=args.start_frame,
+            )
+            all_labels.extend(labels)
+    else:
+        parser.error("Provide --video or --relabel")
+        return
 
-    print(f"\nTotal: {len(all_labels)} frames across {len(args.video)} video(s)")
+    print(f"\nTotal: {len(all_labels)} frames")
     write_csvs(all_labels, args.output_dir)
     print("\nDone! Train TrackNet with:")
     print(f"  python main.py --finetune-tracknet "
