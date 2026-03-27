@@ -27,18 +27,18 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
                               │  (skipped frames reuse results) │
                               └───────────────┬─────────────────┘
                                               │
-          ┌───────────────────────────────────┼──────────────────────┐
-          │                                   │                      │
-   ┌──────▼──────────────┐      ┌─────────────▼──────────────┐      │
-   │  FINE-TUNED YOLO11s │      │     TRACKNET (PRIMARY)     │      │
-   │  Detection+Tracking │      │  3-frame heatmap regression │      │
-   │  4 cls + ByteTrack  │      │  Runs EVERY frame (even     │      │
-   │                     │      │  skipped) for sliding window │      │
-   │  Players, Refs,     │      │                             │      │
-   │  Hoops              │      │  Ball center + confidence   │      │
-   └──────┬──────────────┘      └─────────────┬──────────────┘      │
-          │                                   │                      │
-          │                        ball found? │                      │
+          ┌───────────────────────────────────┼───────────────────────┐
+          │                                   │                       │
+   ┌──────▼──────────────┐      ┌─────────────▼──────────────┐        │
+   │  FINE-TUNED YOLO11s │      │     TRACKNET (PRIMARY)     │        │
+   │  Detection+Tracking │      │  3-frame heatmap regress.  │        │
+   │  4 cls + ByteTrack  │      │  Runs EVERY frame (even sk-│        │
+   │                     │      │  ipped) for sliding window │        │
+   │  Players, Refs,     │      │                            │        │
+   │  Hoops              │      │  Ball center + confidence  │        │
+   └──────┬──────────────┘      └──────────────┬─────────────┘        │
+          │                                    │                      │
+          │                       ball found?  │                      │
           │                   YES ◄────────────┤                      │
           │                    │               NO                     │
           │                    │               │                      │
@@ -68,7 +68,7 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
    │  Jersey OCR         │  │  BallInterpolator    │  │   Every 3rd processed  │
    │  Team classify      │  │  (gap filling)       │  │   frame, cached        │
    │  Velocity tracker   │  │                      │  │                        │
-   └──────┬──────────────┘  └─────────┬────────────┘  └─────────────┬──────────┘
+   └──────┬──────────────┘  └──────────┬───────────┘  └───────────────┬────────┘
           │                            │                              │
           └────────────────────────────┼──────────────────────────────┘
                                        │
