@@ -61,7 +61,7 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
                                        │
           ┌────────────────────────────┼──────────────────────────────┐
           │                            │                              │
-   ┌──────▼──────────────┐  ┌─────────▼────────────┐  ┌─────────────▼──────────┐
+   ┌──────▼──────────────┐  ┌──────────▼───────────┐  ┌───────────────▼────────┐
    │  PLAYER PROCESSING  │  │    BALL TRACKING     │  │   POSE ESTIMATION      │
    │                     │  │                      │  │                        │
    │  Re-ID (jersey+prox)│  │  BallTracker (vel)   │  │   YOLO11n-pose         │
