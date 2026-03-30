@@ -1,13 +1,13 @@
 """
 Auto-label consecutive video frames for TrackNet training using YOLO + SAHI.
 
-Extracts consecutive frames from game videos, runs the existing fine-tuned
-YOLO model + SAHI fallback to detect the basketball, and outputs TrackNet-
-compatible CSV files (frame_path, visibility, x, y).
+Uses the SAME filtering pipeline as main.py (BallValidator + BallTracker)
+to ensure labels match the quality of the main inference output.
 
 Usage:
     python auto_label_tracknet.py --video data/game_01.mp4 [--max-frames 5000]
     python auto_label_tracknet.py --video data/game_01.mp4 data/game_02.mp4
+    python auto_label_tracknet.py --relabel  # re-run on already-extracted frames
 """
 
 import argparse
@@ -22,16 +22,20 @@ from sahi import AutoDetectionModel
 from sahi.predict import get_sliced_prediction
 from ultralytics import YOLO
 
-# Reuse constants from main pipeline
+# Reuse the actual classes and constants from the main pipeline
 from main import (
     CLS_BALL, CLS_HOOP,
     COCO_BALL_CLS, COCO_BALL_CONF,
     SAHI_CONF_THRESH, SAHI_SLICE_SIZE, SAHI_OVERLAP_RATIO,
     SAHI_CROP_PAD, SAHI_MAX_LOST,
     BALL_MAX_BBOX_AREA, BALL_MIN_BBOX_AREA,
-    BALL_MAX_TELEPORT_PX, BALL_TELEPORT_GRACE,
-    build_court_roi, ball_in_court_region,
+    BALL_MAX_TELEPORT_PX,
+    BallValidator, BallTracker,
+    build_court_roi, run_sahi_ball_targeted,
 )
+
+# Minimum confidence for fine-tuned YOLO ball detections (matches main pipeline)
+YOLO_BALL_CONF = 0.25
 
 
 def get_device() -> str:
@@ -40,13 +44,17 @@ def get_device() -> str:
     return "cpu"
 
 
-def detect_ball_frame(model, sahi_model, frame, roi_poly,
+def detect_ball_frame(model, sahi_model, frame, frame_idx,
                       frame_w, frame_h, device, infer_imgsz, use_half,
-                      last_center, frames_since_seen):
-    """Run YOLO + SAHI on a single frame. Return (cx, cy, conf) or None."""
-    ball_dets = []
+                      ball_validator, ball_tracker):
+    """Run YOLO + SAHI on a single frame with full validation pipeline.
 
-    # --- YOLO detection (no tracking, just single-frame) ---
+    Returns (cx, cy, conf) or None.
+    """
+    ball_dets = []
+    hoop_dets = []
+
+    # --- YOLO detection (no tracking, single-frame predict) ---
     det_res = model.predict(
         frame, conf=0.10, iou=0.50,
         imgsz=infer_imgsz, device=device, half=use_half,
@@ -58,33 +66,47 @@ def detect_ball_frame(model, sahi_model, frame, roi_poly,
                 det_res.boxes.xyxy, det_res.boxes.cls, det_res.boxes.conf):
             cls_id = int(cls_id)
             conf_val = float(conf)
-            if cls_id == CLS_BALL:
-                box_list = list(map(int, box.tolist()))
-                area = (box_list[2] - box_list[0]) * (box_list[3] - box_list[1])
-                if BALL_MIN_BBOX_AREA <= area <= BALL_MAX_BBOX_AREA:
-                    cx = (box_list[0] + box_list[2]) / 2.0
-                    cy = (box_list[1] + box_list[3]) / 2.0
-                    if ball_in_court_region(roi_poly, cx, cy, frame_w):
-                        ball_dets.append((cx, cy, conf_val))
+            box_list = list(map(int, box.tolist()))
 
-    # --- SAHI fallback ---
+            if cls_id == CLS_BALL and conf_val >= YOLO_BALL_CONF:
+                w = box_list[2] - box_list[0]
+                h = box_list[3] - box_list[1]
+                area = w * h
+                # Aspect ratio check (ball is roughly circular)
+                if area < BALL_MIN_BBOX_AREA or area > BALL_MAX_BBOX_AREA:
+                    continue
+                if max(w, h) / max(min(w, h), 1) > 1.8:
+                    continue
+                ball_dets.append({
+                    "tid": -1, "box": box_list,
+                    "cls": CLS_BALL, "conf": conf_val,
+                })
+            elif cls_id == CLS_HOOP and conf_val >= 0.30:
+                hoop_dets.append({
+                    "tid": -1, "box": box_list, "cls": CLS_HOOP,
+                })
+
+    # --- SAHI fallback (only when YOLO misses) ---
     if not ball_dets and sahi_model is not None:
-        if last_center is not None and frames_since_seen < SAHI_MAX_LOST:
-            # Targeted SAHI around last known position
-            lx, ly = last_center
-            x1 = max(0, int(lx - SAHI_CROP_PAD))
-            y1 = max(0, int(ly - SAHI_CROP_PAD))
-            x2 = min(frame_w, int(lx + SAHI_CROP_PAD))
-            y2 = min(frame_h, int(ly + SAHI_CROP_PAD))
-            crop = frame[y1:y2, x1:x2]
-            if crop.size > 0:
+        center = ball_tracker.last_center
+        frames_since = ball_tracker.frames_since_seen
+
+        if center is not None and frames_since < SAHI_MAX_LOST:
+            sahi_balls = run_sahi_ball_targeted(
+                sahi_model, frame, center, ball_dets,
+                ball_cls_id=COCO_BALL_CLS)
+            ball_dets.extend(sahi_balls)
+        elif center is None or frames_since >= SAHI_MAX_LOST:
+            # Full-frame SAHI every 5 frames when ball is lost
+            if frame_idx % 5 == 0:
                 result = get_sliced_prediction(
-                    image=crop,
+                    image=frame,
                     detection_model=sahi_model,
-                    slice_height=SAHI_SLICE_SIZE,
-                    slice_width=SAHI_SLICE_SIZE,
-                    overlap_height_ratio=SAHI_OVERLAP_RATIO,
-                    overlap_width_ratio=SAHI_OVERLAP_RATIO,
+                    slice_height=320, slice_width=320,
+                    overlap_height_ratio=0.25,
+                    overlap_width_ratio=0.25,
+                    postprocess_type="NMS",
+                    postprocess_match_threshold=0.40,
                     verbose=0,
                 )
                 for pred in result.object_prediction_list:
@@ -93,54 +115,31 @@ def detect_ball_frame(model, sahi_model, frame, roi_poly,
                     if pred.score.value < COCO_BALL_CONF:
                         continue
                     bb = pred.bbox
-                    # Convert crop-relative back to frame coords
-                    cx = x1 + (bb.minx + bb.maxx) / 2.0
-                    cy = y1 + (bb.miny + bb.maxy) / 2.0
-                    if ball_in_court_region(roi_poly, cx, cy, frame_w):
-                        ball_dets.append((cx, cy, pred.score.value))
-        else:
-            # Full-frame SAHI (expensive, only when ball is lost)
-            result = get_sliced_prediction(
-                image=frame,
-                detection_model=sahi_model,
-                slice_height=SAHI_SLICE_SIZE,
-                slice_width=SAHI_SLICE_SIZE,
-                overlap_height_ratio=SAHI_OVERLAP_RATIO,
-                overlap_width_ratio=SAHI_OVERLAP_RATIO,
-                verbose=0,
-            )
-            for pred in result.object_prediction_list:
-                if int(pred.category.id) != COCO_BALL_CLS:
-                    continue
-                if pred.score.value < COCO_BALL_CONF:
-                    continue
-                bb = pred.bbox
-                cx = (bb.minx + bb.maxx) / 2.0
-                cy = (bb.miny + bb.maxy) / 2.0
-                if ball_in_court_region(roi_poly, cx, cy, frame_w):
-                    ball_dets.append((cx, cy, pred.score.value))
+                    box = [int(bb.minx), int(bb.miny),
+                           int(bb.maxx), int(bb.maxy)]
+                    ball_dets.append({
+                        "tid": -1, "box": box,
+                        "cls": CLS_BALL, "conf": pred.score.value,
+                    })
 
-    if not ball_dets:
+    # --- Apply the SAME filters as the main pipeline ---
+    # BallValidator: court boundary, teleport, backboard constraint
+    ball_dets = ball_validator.filter(frame_idx, ball_dets, hoop_dets)
+    # BallTracker: pick best detection (confidence-based)
+    ball_to_draw = ball_tracker.update(frame_idx, ball_dets)
+
+    if not ball_to_draw:
         return None
 
-    # Pick highest confidence detection
-    best = max(ball_dets, key=lambda d: d[2])
-
-    # Teleport rejection against last known position
-    if last_center is not None and frames_since_seen <= BALL_TELEPORT_GRACE:
-        max_dist = BALL_MAX_TELEPORT_PX * (frame_w / 1920.0) * frames_since_seen
-        dist = ((best[0] - last_center[0]) ** 2 +
-                (best[1] - last_center[1]) ** 2) ** 0.5
-        if dist > max_dist:
-            return None
-
-    return best
+    best = ball_to_draw[0]
+    cx = (best["box"][0] + best["box"][2]) / 2.0
+    cy = (best["box"][1] + best["box"][3]) / 2.0
+    return (cx, cy, best.get("conf", 0.5))
 
 
 @torch.inference_mode()
 def auto_label_video(video_path: str, output_dir: str,
                      weights: str, max_frames: int = 5000,
-                     conf_thresh: float = 0.15,
                      start_frame: int = 0):
     """Extract consecutive frames from a video and auto-label ball positions."""
     cap = cv2.VideoCapture(video_path)
@@ -172,7 +171,10 @@ def auto_label_video(video_path: str, output_dir: str,
         device=device,
     )
 
+    # Use the SAME validator + tracker as the main pipeline
     roi_poly = build_court_roi(frame_w, frame_h)
+    ball_validator = BallValidator(roi_poly, frame_w, frame_h)
+    ball_tracker = BallTracker()
 
     # Output setup
     video_name = Path(video_path).stem
@@ -184,9 +186,7 @@ def auto_label_video(video_path: str, output_dir: str,
     if start_frame > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
-    labels = []         # list of (frame_path, visibility, x, y)
-    last_center = None
-    frames_since_seen = 999
+    labels = []
     detected_count = 0
 
     print(f"Auto-labeling {min(max_frames, total_frames - start_frame)} "
@@ -204,22 +204,19 @@ def auto_label_video(video_path: str, output_dir: str,
         frame_path = str(frames_dir / frame_filename)
         cv2.imwrite(frame_path, frame)
 
-        # Detect ball
+        # Detect ball using full pipeline
         result = detect_ball_frame(
-            model, sahi_model, frame, roi_poly,
+            model, sahi_model, frame, frame_num,
             frame_w, frame_h, device, infer_imgsz, use_half,
-            last_center, frames_since_seen,
+            ball_validator, ball_tracker,
         )
 
-        if result is not None and result[2] >= conf_thresh:
+        if result is not None:
             cx, cy, conf = result
             labels.append((frame_path, 1, round(cx, 1), round(cy, 1)))
-            last_center = (cx, cy)
-            frames_since_seen = 0
             detected_count += 1
         else:
             labels.append((frame_path, 0, -1, -1))
-            frames_since_seen += 1
 
         if (i + 1) % 200 == 0 or i == 0:
             pct = detected_count / (i + 1) * 100
@@ -235,43 +232,14 @@ def auto_label_video(video_path: str, output_dir: str,
     return labels
 
 
-def write_csvs(all_labels: list, output_dir: str, val_split: float = 0.15):
-    """Split labels into train/val CSVs. Keep sequences contiguous."""
-    out_path = Path(output_dir)
-    out_path.mkdir(parents=True, exist_ok=True)
-
-    # Split by contiguous chunks (don't shuffle — that breaks sequences)
-    n = len(all_labels)
-    val_size = int(n * val_split)
-    # Take val from a random contiguous block
-    val_start = random.randint(0, max(n - val_size, 0))
-    val_end = val_start + val_size
-
-    val_labels = all_labels[val_start:val_end]
-    train_labels = all_labels[:val_start] + all_labels[val_end:]
-
-    for split_name, split_labels in [("train", train_labels), ("val", val_labels)]:
-        csv_path = out_path / f"{split_name}.csv"
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["frame_path", "visibility", "x", "y"])
-            for row in split_labels:
-                writer.writerow(row)
-        detected = sum(1 for r in split_labels if r[1] > 0)
-        print(f"  {split_name}: {len(split_labels)} frames, "
-              f"{detected} with ball → {csv_path}")
-
-
 @torch.inference_mode()
 def relabel_existing_frames(frames_dir: str, output_dir: str,
-                            weights: str, conf_thresh: float = 0.15):
-    """Re-run ball detection on already-extracted frame images to generate CSVs.
-    Use this when auto_label_video was interrupted and frames exist but CSVs don't."""
+                            weights: str):
+    """Re-run ball detection on already-extracted frame images."""
     frames_path = Path(frames_dir)
     if not frames_path.exists():
         raise FileNotFoundError(f"Frames directory not found: {frames_dir}")
 
-    # Discover all game subdirectories
     game_dirs = sorted([d for d in frames_path.iterdir() if d.is_dir()])
     if not game_dirs:
         raise FileNotFoundError(f"No game subdirectories found in {frames_dir}")
@@ -302,37 +270,34 @@ def relabel_existing_frames(frames_dir: str, output_dir: str,
 
         print(f"\n{game_dir.name}: {len(frame_files)} frames")
 
-        # Read first frame for dimensions
         sample = cv2.imread(str(frame_files[0]))
         frame_h, frame_w = sample.shape[:2]
         roi_poly = build_court_roi(frame_w, frame_h)
+        ball_validator = BallValidator(roi_poly, frame_w, frame_h)
+        ball_tracker = BallTracker()
 
-        last_center = None
-        frames_since_seen = 999
         detected_count = 0
 
         for i, frame_file in enumerate(frame_files):
             frame = cv2.imread(str(frame_file))
             if frame is None:
                 all_labels.append((str(frame_file), 0, -1, -1))
-                frames_since_seen += 1
+                # Still update tracker so frames_since stays correct
+                ball_tracker.update(i, [])
                 continue
 
             result = detect_ball_frame(
-                model, sahi_model, frame, roi_poly,
+                model, sahi_model, frame, i,
                 frame_w, frame_h, device, infer_imgsz, use_half,
-                last_center, frames_since_seen,
+                ball_validator, ball_tracker,
             )
 
-            if result is not None and result[2] >= conf_thresh:
+            if result is not None:
                 cx, cy, conf = result
                 all_labels.append((str(frame_file), 1, round(cx, 1), round(cy, 1)))
-                last_center = (cx, cy)
-                frames_since_seen = 0
                 detected_count += 1
             else:
                 all_labels.append((str(frame_file), 0, -1, -1))
-                frames_since_seen += 1
 
             if (i + 1) % 200 == 0 or i == 0:
                 pct = detected_count / (i + 1) * 100
@@ -346,14 +311,38 @@ def relabel_existing_frames(frames_dir: str, output_dir: str,
     return all_labels
 
 
+def write_csvs(all_labels: list, output_dir: str, val_split: float = 0.15):
+    """Split labels into train/val CSVs. Keep sequences contiguous."""
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    n = len(all_labels)
+    val_size = int(n * val_split)
+    val_start = random.randint(0, max(n - val_size, 0))
+    val_end = val_start + val_size
+
+    val_labels = all_labels[val_start:val_end]
+    train_labels = all_labels[:val_start] + all_labels[val_end:]
+
+    for split_name, split_labels in [("train", train_labels), ("val", val_labels)]:
+        csv_path = out_path / f"{split_name}.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["frame_path", "visibility", "x", "y"])
+            for row in split_labels:
+                writer.writerow(row)
+        detected = sum(1 for r in split_labels if r[1] > 0)
+        print(f"  {split_name}: {len(split_labels)} frames, "
+              f"{detected} with ball -> {csv_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Auto-label video frames for TrackNet training")
     parser.add_argument("--video", nargs="*", default=None,
                         help="Path(s) to game video(s)")
     parser.add_argument("--relabel", action="store_true",
-                        help="Re-run detection on existing extracted frames "
-                             "(use when previous run was interrupted)")
+                        help="Re-run detection on existing extracted frames")
     parser.add_argument("--weights", type=str,
                         default="runs/detect/train/weights/best.pt",
                         help="Fine-tuned YOLO weights")
@@ -361,8 +350,6 @@ def main():
                         help="Max frames to extract per video")
     parser.add_argument("--start-frame", type=int, default=0,
                         help="Frame to start extraction from")
-    parser.add_argument("--conf-thresh", type=float, default=0.15,
-                        help="Min confidence to accept a detection as label")
     parser.add_argument("--output-dir", type=str,
                         default="data/tracknet_autolabels",
                         help="Output directory for frames and CSVs")
@@ -372,7 +359,6 @@ def main():
         frames_dir = str(Path(args.output_dir) / "frames")
         all_labels = relabel_existing_frames(
             frames_dir, args.output_dir, args.weights,
-            conf_thresh=args.conf_thresh,
         )
     elif args.video:
         all_labels = []
@@ -380,7 +366,6 @@ def main():
             labels = auto_label_video(
                 video, args.output_dir, args.weights,
                 max_frames=args.max_frames,
-                conf_thresh=args.conf_thresh,
                 start_frame=args.start_frame,
             )
             all_labels.extend(labels)

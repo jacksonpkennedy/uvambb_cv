@@ -79,7 +79,7 @@ SAHI_MAX_LOST      = 60     # max frames since last ball sighting to run targete
 
 # TrackNet — heatmap-based ball detection using 3 consecutive frames
 TRACKNET_WEIGHTS     = "runs/tracknet/weights/best.pt"  # path to trained TrackNet weights
-TRACKNET_CONF_THRESH = 0.5                        # heatmap peak confidence threshold
+TRACKNET_CONF_THRESH = 0.3                        # heatmap peak confidence threshold (lower for early training)
 TRACKNET_BALL_RADIUS = 15                          # pixels, for bbox synthesis from center point
 
 # COCO pretrained ball detection — used by SAHI fallback (class 32)
@@ -541,9 +541,9 @@ class BallInterpolator:
         self._buffer: deque = deque()  # deque of (frame_image, ball_box_or_None)
         self._max_teleport = max_teleport
 
-    def push(self, frame: np.ndarray, ball_box: list | None):
+    def push(self, frame: np.ndarray, ball_box: list | None, label: str | None = None):
         """Add a frame and its ball detection (or None) to the buffer."""
-        self._buffer.append((frame, ball_box))
+        self._buffer.append((frame, ball_box, label))
 
     def _interpolate_box(self, box_a: list, box_b: list, t: float) -> list:
         """Linearly interpolate between two boxes. t=0 → box_a, t=1 → box_b."""
@@ -624,7 +624,7 @@ class BallInterpolator:
                         dist_to_prev > 30.0 and dist_to_next > 30.0)
             if is_spike:
                 frame_img = self._buffer[i][0]
-                self._buffer[i] = (frame_img, None)
+                self._buffer[i] = (frame_img, None, None)
 
         # Pass 2: mark 2-frame spike outliers (A→B→B→A pattern)
         for i in range(1, n - 2):
@@ -660,8 +660,8 @@ class BallInterpolator:
             if is_spike:
                 frame_a = self._buffer[i][0]
                 frame_b = self._buffer[i + 1][0]
-                self._buffer[i] = (frame_a, None)
-                self._buffer[i + 1] = (frame_b, None)
+                self._buffer[i] = (frame_a, None, None)
+                self._buffer[i + 1] = (frame_b, None, None)
 
         # Pass 3: mark 3-frame spike outliers (A→B→B→B→A pattern)
         for i in range(1, n - 3):
@@ -696,7 +696,7 @@ class BallInterpolator:
             if is_spike:
                 for k in range(3):
                     frame_img = self._buffer[i + k][0]
-                    self._buffer[i + k] = (frame_img, None)
+                    self._buffer[i + k] = (frame_img, None, None)
 
     def _fill_gaps(self):
         """Reject outlier spikes, then fill gaps with interpolated positions."""
@@ -740,7 +740,7 @@ class BallInterpolator:
                 else:
                     interp_box = self._interpolate_box(box_before, box_after, t)
                 frame_img = self._buffer[j][0]
-                self._buffer[j] = (frame_img, interp_box)
+                self._buffer[j] = (frame_img, interp_box, None)  # label=None → "INTERP"
 
     def pop_ready(self) -> list:
         """Return finalized frames that are safe to write.
@@ -753,8 +753,8 @@ class BallInterpolator:
         # Pop frames that are far enough from the buffer edge
         ready = []
         while len(self._buffer) > half:
-            frame_img, ball_box = self._buffer.popleft()
-            ready.append((frame_img, ball_box))
+            frame_img, ball_box, label = self._buffer.popleft()
+            ready.append((frame_img, ball_box, label))
         return ready
 
     def flush(self) -> list:
@@ -762,8 +762,8 @@ class BallInterpolator:
         self._fill_gaps()
         ready = []
         while self._buffer:
-            frame_img, ball_box = self._buffer.popleft()
-            ready.append((frame_img, ball_box))
+            frame_img, ball_box, label = self._buffer.popleft()
+            ready.append((frame_img, ball_box, label))
         return ready
 
 
@@ -1332,7 +1332,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         )
 
     roi_poly      = build_court_roi(frame_w, frame_h)
-    ghost_max_age = int(fps * 1.5)
+    ghost_max_age = int(fps * 0.5)   # 0.5s — was 1.5s, caused stale boxes in empty space
     memory        = TrackMemory(max_age=ghost_max_age)
     reid_buffer   = TemporalReIDBuffer()
     vel_tracker   = VelocityTracker()
@@ -1352,8 +1352,8 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
     )
 
     frame_idx = 0
-    frame_skip = 2       # process every Nth frame (1 = no skip)
-    pose_interval = 3    # run pose every Nth processed frame
+    frame_skip = 1       # process every frame (no skip)
+    pose_interval = 1    # run pose every processed frame
     pose_counter = 0     # counter for processed frames
     last_ball_box = None  # cache ball result for skipped frames
     # Cache last-processed-frame annotations so skipped frames aren't bare
@@ -1399,10 +1399,12 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                 team_color = team_clf.get_team_color(tid)
                 draw_player(frame, d["box"], label, color=team_color)
 
-            ball_interp.push(frame, tracknet_ball_box if tracknet_ball_box else last_ball_box)
-            for fin_frame, fin_ball_box in ball_interp.pop_ready():
+            skip_ball = tracknet_ball_box if tracknet_ball_box else last_ball_box
+            skip_label = "BALL (TrackNet)" if tracknet_ball_box else None
+            ball_interp.push(frame, skip_ball, skip_label)
+            for fin_frame, fin_ball_box, fin_label in ball_interp.pop_ready():
                 if fin_ball_box is not None:
-                    draw_ball(fin_frame, fin_ball_box)
+                    draw_ball(fin_frame, fin_ball_box, label=fin_label or "BALL (INTERP)")
                 out_video.write(fin_frame)
             frame_idx += 1
             continue
@@ -1562,18 +1564,19 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         # Ball is NOT drawn yet — the interpolator will fill gaps first.
         ball_box = ball_to_draw[0]["box"] if ball_to_draw else None
         last_ball_box = ball_box  # cache for skipped frames
-        ball_interp.push(frame, ball_box)
+        ball_label = f"BALL ({ball_source})" if ball_box else None
+        ball_interp.push(frame, ball_box, ball_label)
 
         # Write finalized frames (interpolator releases them after look-ahead)
-        for fin_frame, fin_ball_box in ball_interp.pop_ready():
+        for fin_frame, fin_ball_box, fin_label in ball_interp.pop_ready():
             if fin_ball_box is not None:
-                draw_ball(fin_frame, fin_ball_box)
+                draw_ball(fin_frame, fin_ball_box, label=fin_label or "BALL (INTERP)")
             out_video.write(fin_frame)
 
         frame_idx += 1
 
         t_frame = time.perf_counter() - t_frame_start
-        if frame_idx <= 5 or frame_idx % 30 == 0:
+        if frame_idx % 30 == 0 or frame_idx <= 5:
             n_jerseys = sum(1 for d in real_dets if jersey_ocr.get_jersey(d["tid"]))
             print(f"  frame {frame_idx}/{total_frames}  "
                   f"| {t_frame:.2f}s/frame  "
@@ -1583,9 +1586,9 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                   f"| ball={ball_source if ball_to_draw else 'no'}")
 
     # Flush remaining buffered frames
-    for fin_frame, fin_ball_box in ball_interp.flush():
+    for fin_frame, fin_ball_box, fin_label in ball_interp.flush():
         if fin_ball_box is not None:
-            draw_ball(fin_frame, fin_ball_box)
+            draw_ball(fin_frame, fin_ball_box, label=fin_label or "BALL (INTERP)")
         out_video.write(fin_frame)
 
     cap.release()
