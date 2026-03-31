@@ -2,7 +2,7 @@
 TrackNet-style ball tracker — encoder-decoder heatmap regression for small ball detection.
 
 Architecture based on TrackNetV3 with U-Net skip connections:
-  - Input: 3 consecutive RGB frames stacked → 9-channel tensor (640×360)
+  - Input: 3 consecutive RGB frames + 2 motion diff maps → 11-channel tensor (640×360)
   - Output: 1-channel sigmoid heatmap
   - Ball location: extracted via weighted centroid of peak region
 
@@ -52,7 +52,10 @@ class ConvBlock(nn.Module):
 class TrackNetV3(nn.Module):
     """Encoder-decoder CNN with U-Net skip connections.
 
-    Input:  (B, 9, 360, 640)  — 3 consecutive RGB frames
+    Input:  (B, 11, 360, 640) — 3 consecutive RGB frames + 2 motion diff maps (V4)
+            Channels 0-8:  frame_{t-2}, frame_{t-1}, frame_t  (RGB each)
+            Channel 9:     |frame_{t-1} - frame_{t-2}|  (grayscale motion)
+            Channel 10:    |frame_t     - frame_{t-1}|  (grayscale motion)
     Output: (B, 1, 360, 640)  — heatmap sigmoid (or logits during training)
 
     Skip connections (U-Net style) are the key difference from the plain
@@ -64,7 +67,7 @@ class TrackNetV3(nn.Module):
         super().__init__()
 
         # --- Encoder ---
-        self.conv1 = ConvBlock(9, 64)
+        self.conv1 = ConvBlock(11, 64)   # 9 RGB + 2 motion diff maps (V4)
         self.conv2 = ConvBlock(64, 64)          # → skip1 (64ch, full res)
         self.pool1 = nn.MaxPool2d(2, 2)
         self.conv3 = ConvBlock(64, 128)
@@ -210,11 +213,11 @@ def postprocess_heatmap(heatmap: np.ndarray,
 # ---------------------------------------------------------------------------
 
 def generate_heatmap(cx: int, cy: int, w: int = INPUT_W, h: int = INPUT_H,
-                     sigma: float = 2.5) -> np.ndarray:
+                     sigma: float = 3.16) -> np.ndarray:
     """Generate a 2D Gaussian heatmap centered at (cx, cy).
 
-    Sigma=2.5 matches TrackNetV3 paper (~10px in the original 1280x720 res,
-    scaled to 640x360 → ~5px, FWHM ≈ 2.35*2.5 ≈ 6px).
+    Sigma=3.16 = sqrt(10) per TrackNetV1 paper (sigma^2=10).
+    FWHM ≈ 2.35 * 3.16 ≈ 7.4px at model resolution 640x360.
 
     Returns (h, w) float32 array with values in [0, 1].
     """
@@ -226,6 +229,59 @@ def generate_heatmap(cx: int, cy: int, w: int = INPUT_W, h: int = INPUT_H,
     xx, yy = np.meshgrid(xs, ys)
     hmap = np.exp(-((xx - cx)**2 + (yy - cy)**2) / (2 * sigma**2))
     return hmap
+
+
+# ---------------------------------------------------------------------------
+# PE (Positioning Error) evaluation — TrackNet paper metric
+# ---------------------------------------------------------------------------
+
+def evaluate_pe(model: "TrackNetV3", loader, device: str,
+                pe_thresh: float = 5.0,
+                conf_thresh: float = 0.5) -> dict:
+    """Compute precision, recall, F1 at PE≤5px threshold (paper standard).
+
+    TP: model predicts ball AND predicted center ≤ pe_thresh px from GT.
+    FP: model predicts ball but no GT, or distance > pe_thresh.
+    FN: model predicts no ball but GT exists.
+    """
+    tp = fp = fn = 0
+    model.eval()
+    use_amp = device != "cpu"
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+        for inp, target, vis_flags in loader:
+            inp    = inp.to(device, non_blocking=True)
+            out    = model(inp)          # (B, 1, H, W) sigmoid
+            pred_np   = out.cpu().numpy()
+            target_np = target.cpu().numpy()
+            vis_np    = vis_flags.cpu().numpy()
+            for b in range(pred_np.shape[0]):
+                has_ball = int(vis_np[b]) > 0
+                gt_hmap  = target_np[b, 0]
+                if has_ball:
+                    gt_y, gt_x = divmod(int(gt_hmap.argmax()), INPUT_W)
+                else:
+                    gt_x = gt_y = -1
+                pred_hmap   = pred_np[b, 0]
+                pred_conf   = float(pred_hmap.max())
+                pred_detect = pred_conf >= conf_thresh
+                if pred_detect:
+                    pr_y, pr_x = divmod(int(pred_hmap.argmax()), INPUT_W)
+                if pred_detect and has_ball:
+                    dist = math.hypot(pr_x - gt_x, pr_y - gt_y)
+                    if dist <= pe_thresh:
+                        tp += 1
+                    else:
+                        fp += 1
+                        fn += 1
+                elif pred_detect:
+                    fp += 1
+                elif has_ball:
+                    fn += 1
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    return {"precision": prec, "recall": rec, "f1": f1,
+            "tp": tp, "fp": fp, "fn": fn}
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +370,23 @@ class TrackNetDataset(Dataset):
         return len(self.sequences)
 
     def _load_frame(self, path: str) -> tuple:
-        """Load a frame → ((3, H, W) float32 [0,1], orig_w, orig_h)."""
+        """Load a frame → ((3, H, W) float32 [0,1], orig_w, orig_h).
+
+        Checks for a pre-resized cache first (saved by --preprocess).
+        Cache is already 640×360 so no resize needed — ~3-4x faster loading.
+        A sidecar .txt file stores original dims for correct label scaling.
+        """
+        p = Path(path)
+        cache_img  = p.parent / f"{p.stem}_640x360.jpg"
+        cache_dims = p.parent / f"{p.stem}_640x360.txt"
+
+        if cache_img.exists() and cache_dims.exists():
+            img = cv2.imread(str(cache_img))
+            if img is not None:
+                orig_w, orig_h = map(int, cache_dims.read_text().split())
+                return (np.transpose(img, (2, 0, 1)).astype(np.float32) / 255.0,
+                        orig_w, orig_h)
+
         img = cv2.imread(path)
         if img is None:
             return (np.zeros((3, INPUT_H, INPUT_W), dtype=np.float32), INPUT_W, INPUT_H)
@@ -381,7 +453,12 @@ class TrackNetDataset(Dataset):
                 f2_hwc = cv2.filter2D(f2_hwc, -1, kernel)
                 f2 = np.transpose(f2_hwc, (2, 0, 1)).astype(np.float32)
 
-        inp = np.concatenate([f0, f1, f2], axis=0)   # (9, H, W)
+        # Motion diff maps (V4): |frame_{t-1} - frame_{t-2}| and |frame_t - frame_{t-1}|
+        # Computed AFTER augmentation so they reflect the augmented frames.
+        # Averaged over RGB channels → (1, H, W) motion magnitude in [0, 1].
+        diff01 = np.abs(f1 - f0).mean(axis=0, keepdims=True)  # (1, H, W)
+        diff12 = np.abs(f2 - f1).mean(axis=0, keepdims=True)  # (1, H, W)
+        inp = np.concatenate([f0, f1, f2, diff01, diff12], axis=0)   # (11, H, W)
 
         if cx >= 0 and cy >= 0 and vis2 > 0:
             hmap = generate_heatmap(int(cx), int(cy), INPUT_W, INPUT_H,
@@ -427,7 +504,8 @@ class MixupCollate:
 def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
                    lr: float = 1e-3, device: str = "cuda:0",
                    output_dir: str = "runs/tracknet/weights",
-                   num_workers: int = 4):
+                   num_workers: int = 4,
+                   resume: bool = False):
     """Train TrackNetV3 on basketball frame sequences."""
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -436,9 +514,9 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
     val_csv   = str(Path(data_dir) / "val.csv")
 
     print("Building training dataset ...")
-    train_ds = TrackNetDataset(train_csv, sigma=2.5,
+    train_ds = TrackNetDataset(train_csv, sigma=3.16,
                                oversample_visible=True, augment=True)
-    val_ds   = (TrackNetDataset(val_csv, sigma=2.5, augment=False)
+    val_ds   = (TrackNetDataset(val_csv, sigma=3.16, augment=False)
                 if Path(val_csv).exists() else None)
 
     # Lazy loading: use num_workers for parallel disk I/O
@@ -461,6 +539,16 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
     ) if val_ds else None)
 
     model = TrackNetV3().to(device)
+    # torch.compile requires Triton which is Linux-only — skip on Windows
+    import platform
+    if platform.system() != "Windows":
+        try:
+            model = torch.compile(model)
+            print("  torch.compile: enabled")
+        except Exception as e:
+            print(f"  torch.compile: skipped ({e})")
+    else:
+        print("  torch.compile: skipped (Windows/no Triton)")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6)
@@ -468,14 +556,28 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
     use_amp = device != "cpu"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    # pos_weight=200: ball pixels are ~0.004% of heatmap (1 pixel / 640*360)
-    # High weight ensures model can't just predict all-zeros and get low loss
     pos_weight = torch.tensor([200.0], device=device)
     neg_weight = torch.ones(1, device=device)
 
     best_val_loss = float("inf")
+    start_epoch   = 0
 
-    for epoch in range(epochs):
+    # Resume from last checkpoint if requested
+    ckpt_path = out_path / "last_ckpt.pt"
+    if resume and ckpt_path.exists():
+        ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start_epoch   = ckpt["epoch"] + 1
+        best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        print(f"  Resumed from epoch {start_epoch} "
+              f"(best_val_loss={best_val_loss:.4f})")
+    elif resume:
+        print("  No checkpoint found — starting from scratch")
+
+    for epoch in range(start_epoch, epochs):
         # --- Train ---
         model.train()
         train_loss = 0.0
@@ -524,18 +626,36 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
                     val_loss += loss.item()
             avg_val = val_loss / max(len(val_loader), 1)
 
-        print(f"Epoch {epoch+1}/{epochs}  "
-              f"train_loss={avg_train:.4f}  val_loss={avg_val:.4f}")
+        if val_loader:
+            pe = evaluate_pe(model, val_loader, device,
+                             pe_thresh=5.0, conf_thresh=0.5)
+            print(f"Epoch {epoch+1}/{epochs}  "
+                  f"train_loss={avg_train:.4f}  val_loss={avg_val:.4f}  "
+                  f"prec={pe['precision']:.3f}  rec={pe['recall']:.3f}  "
+                  f"F1={pe['f1']:.3f}  "
+                  f"(TP={pe['tp']} FP={pe['fp']} FN={pe['fn']})")
+        else:
+            print(f"Epoch {epoch+1}/{epochs}  "
+                  f"train_loss={avg_train:.4f}  val_loss={avg_val:.4f}")
 
         scheduler.step(avg_val if val_loader else avg_train)
 
-        # Save best model
+        # Save best model weights
         if avg_val < best_val_loss:
             best_val_loss = avg_val
             torch.save(model.state_dict(), str(out_path / "best.pt"))
             print(f"  → Saved best model (val_loss={avg_val:.4f})")
 
-        # Save latest checkpoint
+        # Save full resumable checkpoint (weights + optimizer + scheduler + epoch)
+        torch.save({
+            "epoch":          epoch,
+            "model":          model.state_dict(),
+            "optimizer":      optimizer.state_dict(),
+            "scheduler":      scheduler.state_dict(),
+            "scaler":         scaler.state_dict(),
+            "best_val_loss":  best_val_loss,
+        }, str(out_path / "last_ckpt.pt"))
+        # Also save bare weights for inference
         torch.save(model.state_dict(), str(out_path / "last.pt"))
 
     print(f"\nTraining complete. Best model: {out_path / 'best.pt'}")
@@ -612,11 +732,15 @@ class TrackNetInference:
         if len(self._frame_buf) < 3:
             return None
 
-        # Stack 3 frames → (1, 9, H, W) tensor
-        stacked = np.concatenate(list(self._frame_buf), axis=2)
-        stacked = stacked.astype(np.float32) / 255.0
-        inp = np.transpose(stacked, (2, 0, 1))      # (9, H, W)
-        inp = np.expand_dims(inp, axis=0)            # (1, 9, H, W)
+        # Build 11-channel input: 9 RGB + 2 motion diff maps (V4)
+        frames = [f.astype(np.float32) / 255.0 for f in self._frame_buf]
+        f0 = np.transpose(frames[0], (2, 0, 1))     # (3, H, W) t-2
+        f1 = np.transpose(frames[1], (2, 0, 1))     # (3, H, W) t-1
+        f2 = np.transpose(frames[2], (2, 0, 1))     # (3, H, W) t
+        diff01 = np.abs(f1 - f0).mean(axis=0, keepdims=True)  # (1, H, W)
+        diff12 = np.abs(f2 - f1).mean(axis=0, keepdims=True)  # (1, H, W)
+        inp = np.concatenate([f0, f1, f2, diff01, diff12], axis=0)  # (11, H, W)
+        inp = np.expand_dims(inp, axis=0)            # (1, 11, H, W)
         tensor = torch.from_numpy(inp).to(self.device)
 
         with torch.no_grad():
@@ -656,23 +780,66 @@ class TrackNetInference:
 # CLI — standalone training
 # ---------------------------------------------------------------------------
 
+def preprocess_frames(data_dir: str) -> None:
+    """Pre-resize all frames in train.csv + val.csv to 640×360 and save as
+    {stem}_640x360.jpg alongside the originals. One-time cost; subsequent
+    training runs skip the resize and load ~3-4x faster.
+    """
+    paths: set = set()
+    for split in ("train.csv", "val.csv"):
+        p = Path(data_dir) / split
+        if not p.exists():
+            continue
+        with open(p, newline="") as f:
+            for row in csv.DictReader(f):
+                paths.add(row["frame_path"])
+
+    print(f"Pre-resizing {len(paths)} unique frames to {INPUT_W}×{INPUT_H} ...")
+    done = skipped = 0
+    for i, path in enumerate(sorted(paths)):
+        src       = Path(path)
+        dst_img   = src.parent / f"{src.stem}_640x360.jpg"
+        dst_dims  = src.parent / f"{src.stem}_640x360.txt"
+        if dst_img.exists() and dst_dims.exists():
+            skipped += 1
+            continue
+        img = cv2.imread(str(src))
+        if img is None:
+            continue
+        orig_h, orig_w = img.shape[:2]
+        img = cv2.resize(img, (INPUT_W, INPUT_H), interpolation=cv2.INTER_AREA)
+        cv2.imwrite(str(dst_img), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        dst_dims.write_text(f"{orig_w} {orig_h}")
+        done += 1
+        if (i + 1) % 1000 == 0:
+            print(f"  {i+1}/{len(paths)} ...")
+    print(f"Done: {done} resized, {skipped} already cached.")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="TrackNet ball tracker")
     parser.add_argument("--train", action="store_true",
                         help="Train TrackNet on basketball data")
+    parser.add_argument("--preprocess", action="store_true",
+                        help="Pre-resize all frames to 640×360 for faster training")
     parser.add_argument("--data", default="data/tracknet_labels/",
                         help="Directory containing train.csv / val.csv")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--batch", type=int, default=32,
+                        help="Batch size (default 32 — RTX 4070 fits ~32 at fp16)")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--workers", type=int, default=4,
-                        help="DataLoader num_workers")
+    parser.add_argument("--workers", type=int, default=8,
+                        help="DataLoader num_workers (default 8)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume training from last_ckpt.pt checkpoint")
     args = parser.parse_args()
 
-    if args.train:
+    if args.preprocess:
+        preprocess_frames(args.data)
+    elif args.train:
         train_tracknet(args.data, epochs=args.epochs, batch_size=args.batch,
                        lr=args.lr, device=args.device,
-                       num_workers=args.workers)
+                       num_workers=args.workers, resume=args.resume)
     else:
-        print("Use --train to start training. See --help for options.")
+        print("Use --train or --preprocess. See --help for options.")
