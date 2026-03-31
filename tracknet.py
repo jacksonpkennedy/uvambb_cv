@@ -232,6 +232,33 @@ def generate_heatmap(cx: int, cy: int, w: int = INPUT_W, h: int = INPUT_H,
 
 
 # ---------------------------------------------------------------------------
+# CenterNet focal loss — heatmap regression (Zhou et al. 2019)
+# ---------------------------------------------------------------------------
+
+def focal_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """CenterNet focal loss for heatmap regression.
+
+    For ball pixels (GT > 0): penalises by (1-pred)^2 so confident correct
+    predictions are down-weighted.
+    For background pixels: penalises by (1-GT)^4 * pred^2 so near-GT pixels
+    (which are almost-ball by the Gaussian spread) are treated leniently.
+    Normalised by number of positive pixels to remain scale-stable.
+    """
+    pred = torch.sigmoid(pred_logits)
+    pos_mask = (target >= 0.01).float()
+    neg_mask = 1.0 - pos_mask
+
+    pos_loss = -(torch.pow(1.0 - pred, 2.0)
+                 * torch.log(pred.clamp(min=1e-6))) * pos_mask
+    neg_loss = -(torch.pow(1.0 - target, 4.0)
+                 * torch.pow(pred, 2.0)
+                 * torch.log((1.0 - pred).clamp(min=1e-6))) * neg_mask
+
+    num_pos = pos_mask.sum().clamp(min=1)
+    return (pos_loss.sum() + neg_loss.sum()) / num_pos
+
+
+# ---------------------------------------------------------------------------
 # PE (Positioning Error) evaluation — TrackNet paper metric
 # ---------------------------------------------------------------------------
 
@@ -377,15 +404,16 @@ class TrackNetDataset(Dataset):
         A sidecar .txt file stores original dims for correct label scaling.
         """
         p = Path(path)
-        cache_img  = p.parent / f"{p.stem}_640x360.jpg"
+        # .npy cache: uint8 (H,W,3) array + sidecar .txt for orig dims
+        # numpy load is ~5x faster than JPEG decode — critical on Windows
+        cache_npy  = p.parent / f"{p.stem}_640x360.npy"
         cache_dims = p.parent / f"{p.stem}_640x360.txt"
 
-        if cache_img.exists() and cache_dims.exists():
-            img = cv2.imread(str(cache_img))
-            if img is not None:
-                orig_w, orig_h = map(int, cache_dims.read_text().split())
-                return (np.transpose(img, (2, 0, 1)).astype(np.float32) / 255.0,
-                        orig_w, orig_h)
+        if cache_npy.exists() and cache_dims.exists():
+            img = np.load(str(cache_npy))          # uint8 (H,W,3), ~0.2ms
+            orig_w, orig_h = map(int, cache_dims.read_text().split())
+            return (np.transpose(img, (2, 0, 1)).astype(np.float32) / 255.0,
+                    orig_w, orig_h)
 
         img = cv2.imread(path)
         if img is None:
@@ -550,17 +578,29 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
     else:
         print("  torch.compile: skipped (Windows/no Triton)")
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=5, min_lr=1e-6)
+    # OneCycleLR: warm-up for 30% of training then cosine-anneal to min_lr.
+    # Step per batch (not per epoch) for smooth LR curve.
+    # Must be recreated with correct steps_per_epoch BEFORE loading checkpoint.
+    _steps_per_epoch = len(train_loader)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=3e-4,
+        epochs=epochs,
+        steps_per_epoch=_steps_per_epoch,
+        pct_start=0.3,
+        anneal_strategy="cos",
+        div_factor=25.0,
+        final_div_factor=1e4,
+    )
 
     use_amp = device != "cpu"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    pos_weight = torch.tensor([200.0], device=device)
-    neg_weight = torch.ones(1, device=device)
-
-    best_val_loss = float("inf")
-    start_epoch   = 0
+    best_val_loss  = float("inf")
+    best_f1        = 0.0
+    no_improve     = 0       # epochs since best F1 improved
+    early_stop_pat = 15      # stop if no F1 improvement for this many epochs
+    start_epoch    = 0
 
     # Resume from last checkpoint if requested
     ckpt_path = out_path / "last_ckpt.pt"
@@ -572,8 +612,10 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
         scaler.load_state_dict(ckpt["scaler"])
         start_epoch   = ckpt["epoch"] + 1
         best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        best_f1       = ckpt.get("best_f1", 0.0)
+        no_improve    = ckpt.get("no_improve", 0)
         print(f"  Resumed from epoch {start_epoch} "
-              f"(best_val_loss={best_val_loss:.4f})")
+              f"(best_f1={best_f1:.3f}, no_improve={no_improve})")
     elif resume:
         print("  No checkpoint found — starting from scratch")
 
@@ -587,10 +629,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 out  = model(inp)
-                loss = nn.functional.binary_cross_entropy_with_logits(
-                    out, target,
-                    weight=torch.where(target > 0.5, pos_weight, neg_weight),
-                )
+                loss = focal_loss(out, target)
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -599,6 +638,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
+            scheduler.step()
 
             train_loss += loss.item()
 
@@ -619,10 +659,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
                     inp    = inp.to(device, non_blocking=True)
                     target = target.to(device, non_blocking=True)
                     out    = model(inp)
-                    loss   = nn.functional.binary_cross_entropy_with_logits(
-                        out, target,
-                        weight=torch.where(target > 0.5, pos_weight, neg_weight),
-                    )
+                    loss   = focal_loss(out, target)
                     val_loss += loss.item()
             avg_val = val_loss / max(len(val_loader), 1)
 
@@ -634,14 +671,22 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
                   f"prec={pe['precision']:.3f}  rec={pe['recall']:.3f}  "
                   f"F1={pe['f1']:.3f}  "
                   f"(TP={pe['tp']} FP={pe['fp']} FN={pe['fn']})")
+            # Track best F1 for early stopping (more reliable than val loss
+            # because val loss is dominated by the many empty frames)
+            if pe["f1"] > best_f1:
+                best_f1    = pe["f1"]
+                no_improve = 0
+                torch.save(model.state_dict(), str(out_path / "best.pt"))
+                print(f"  → Saved best model (F1={best_f1:.3f})")
+            else:
+                no_improve += 1
+                print(f"  No F1 improvement ({no_improve}/{early_stop_pat})")
         else:
             print(f"Epoch {epoch+1}/{epochs}  "
                   f"train_loss={avg_train:.4f}  val_loss={avg_val:.4f}")
 
-        scheduler.step(avg_val if val_loader else avg_train)
-
-        # Save best model weights
-        if avg_val < best_val_loss:
+        # Save best model weights by val loss (fallback when no val PE available)
+        if not val_loader and avg_val < best_val_loss:
             best_val_loss = avg_val
             torch.save(model.state_dict(), str(out_path / "best.pt"))
             print(f"  → Saved best model (val_loss={avg_val:.4f})")
@@ -654,9 +699,18 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
             "scheduler":      scheduler.state_dict(),
             "scaler":         scaler.state_dict(),
             "best_val_loss":  best_val_loss,
+            "best_f1":        best_f1,
+            "no_improve":     no_improve,
         }, str(out_path / "last_ckpt.pt"))
         # Also save bare weights for inference
         torch.save(model.state_dict(), str(out_path / "last.pt"))
+
+        # Early stopping — based on F1 since val loss is unreliable with
+        # class-imbalanced data (empty frames dominate)
+        if val_loader and no_improve >= early_stop_pat:
+            print(f"\nEarly stopping: F1 hasn't improved for "
+                  f"{early_stop_pat} epochs (best F1={best_f1:.3f})")
+            break
 
     print(f"\nTraining complete. Best model: {out_path / 'best.pt'}")
     return str(out_path / "best.pt")
@@ -743,10 +797,16 @@ class TrackNetInference:
         inp = np.expand_dims(inp, axis=0)            # (1, 11, H, W)
         tensor = torch.from_numpy(inp).to(self.device)
 
-        with torch.no_grad():
-            out = self.model(tensor)                 # (1, 1, H, W) sigmoid
-
-        heatmap = out[0].cpu().numpy()               # (1, H, W) float32 [0,1]
+        # TTA: average original + horizontally-flipped heatmaps.
+        # Flip along the width axis (dim=-1), run both through the model,
+        # then flip the second prediction back before averaging.
+        tensor_flip = torch.flip(tensor, dims=[-1])
+        with torch.no_grad(), torch.amp.autocast(
+                "cuda", enabled=self.device != "cpu"):
+            out_orig = torch.sigmoid(self.model(tensor))       # (1,1,H,W)
+            out_flip = torch.sigmoid(self.model(tensor_flip))  # (1,1,H,W)
+        out_flip_back = torch.flip(out_flip, dims=[-1])
+        heatmap = ((out_orig + out_flip_back) / 2.0)[0].cpu().numpy()  # (1,H,W)
 
         scale_x = w / INPUT_W
         scale_y = h / INPUT_H
@@ -781,9 +841,12 @@ class TrackNetInference:
 # ---------------------------------------------------------------------------
 
 def preprocess_frames(data_dir: str) -> None:
-    """Pre-resize all frames in train.csv + val.csv to 640×360 and save as
-    {stem}_640x360.jpg alongside the originals. One-time cost; subsequent
-    training runs skip the resize and load ~3-4x faster.
+    """Pre-resize all frames to 640×360 and save as .npy binary arrays.
+
+    .npy loads ~5x faster than JPEG decode — eliminates the data loading
+    bottleneck on Windows where multiprocessing spawn overhead is high.
+    Disk cost: ~691KB per frame (vs ~20KB JPEG) — ~19GB for 28K frames.
+    One-time cost; run once before training.
     """
     paths: set = set()
     for split in ("train.csv", "val.csv"):
@@ -794,13 +857,14 @@ def preprocess_frames(data_dir: str) -> None:
             for row in csv.DictReader(f):
                 paths.add(row["frame_path"])
 
-    print(f"Pre-resizing {len(paths)} unique frames to {INPUT_W}×{INPUT_H} ...")
+    print(f"Pre-processing {len(paths)} frames → .npy cache ...")
+    print(f"  Estimated disk: {len(paths) * 691 / 1024:.0f} MB")
     done = skipped = 0
     for i, path in enumerate(sorted(paths)):
         src       = Path(path)
-        dst_img   = src.parent / f"{src.stem}_640x360.jpg"
+        dst_npy   = src.parent / f"{src.stem}_640x360.npy"
         dst_dims  = src.parent / f"{src.stem}_640x360.txt"
-        if dst_img.exists() and dst_dims.exists():
+        if dst_npy.exists() and dst_dims.exists():
             skipped += 1
             continue
         img = cv2.imread(str(src))
@@ -808,12 +872,12 @@ def preprocess_frames(data_dir: str) -> None:
             continue
         orig_h, orig_w = img.shape[:2]
         img = cv2.resize(img, (INPUT_W, INPUT_H), interpolation=cv2.INTER_AREA)
-        cv2.imwrite(str(dst_img), img, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        np.save(str(dst_npy), img)               # saves uint8 (H,W,3)
         dst_dims.write_text(f"{orig_w} {orig_h}")
         done += 1
         if (i + 1) % 1000 == 0:
             print(f"  {i+1}/{len(paths)} ...")
-    print(f"Done: {done} resized, {skipped} already cached.")
+    print(f"Done: {done} saved as .npy, {skipped} already cached.")
 
 
 if __name__ == "__main__":

@@ -468,8 +468,9 @@ class TeamClassifier:
 class BallTracker:
     """Track ball detections — pick best detection per frame.
     Simplified for TrackNet: typically 1 detection per frame.
-    TrackNet is the sole ball detector; picks highest-confidence detection
-    and maintains velocity history for the interpolator."""
+    TrackNet is the sole ball detector; picks highest-confidence detection,
+    maintains velocity history for the interpolator, and applies a Kalman
+    filter (constant-velocity model) to smooth frame-to-frame jitter."""
 
     _VEL_HISTORY = 5       # frames of velocity history to average
 
@@ -480,6 +481,39 @@ class BallTracker:
         self._vel_history: deque = deque(maxlen=self._VEL_HISTORY)
         self._last_cx: float = 0.0
         self._last_cy: float = 0.0
+
+        # Kalman filter state (4-state constant-velocity: x, y, vx, vy)
+        self._kf_x: np.ndarray | None = None   # (4,1) state vector
+        self._kf_P: np.ndarray | None = None   # (4,4) covariance
+        # Transition model: x_t = F * x_{t-1}
+        self._kf_F = np.array([[1,0,1,0],[0,1,0,1],
+                                [0,0,1,0],[0,0,0,1]], dtype=np.float64)
+        # Observation model: z = H * x  (we observe x,y only)
+        self._kf_H = np.array([[1,0,0,0],[0,1,0,0]], dtype=np.float64)
+        self._kf_R = np.eye(2, dtype=np.float64) * 15.0  # measurement noise
+        self._kf_Q = np.eye(4, dtype=np.float64) * 0.5   # process noise
+
+    def _kf_init(self, cx: float, cy: float) -> None:
+        self._kf_x = np.array([[cx],[cy],[0.0],[0.0]], dtype=np.float64)
+        self._kf_P = np.eye(4, dtype=np.float64) * 100.0
+
+    def _kf_predict(self) -> None:
+        if self._kf_x is None:
+            return
+        self._kf_x = self._kf_F @ self._kf_x
+        self._kf_P = self._kf_F @ self._kf_P @ self._kf_F.T + self._kf_Q
+
+    def _kf_update(self, cx: float, cy: float) -> tuple[float, float]:
+        """Update Kalman state with measurement, return smoothed (cx, cy)."""
+        if self._kf_x is None:
+            self._kf_init(cx, cy)
+            return cx, cy
+        z = np.array([[cx],[cy]], dtype=np.float64)
+        S = self._kf_H @ self._kf_P @ self._kf_H.T + self._kf_R
+        K = self._kf_P @ self._kf_H.T @ np.linalg.inv(S)
+        self._kf_x = self._kf_x + K @ (z - self._kf_H @ self._kf_x)
+        self._kf_P = (np.eye(4) - K @ self._kf_H) @ self._kf_P
+        return float(self._kf_x[0, 0]), float(self._kf_x[1, 0])
 
     @property
     def last_center(self) -> tuple | None:
@@ -493,28 +527,50 @@ class BallTracker:
         return self._frames_since
 
     def update(self, frame_idx: int, ball_dets: list) -> list:
-        """Return best ball detection. Picks highest confidence."""
+        """Return best ball detection with Kalman-smoothed center."""
         self._frames_since = frame_idx - self._last_seen_frame
         if not ball_dets:
+            # Propagate Kalman prediction even when ball not detected
+            self._kf_predict()
             return []
 
         # Pick highest confidence detection
         best = max(ball_dets, key=lambda d: d.get("conf", 0.5))
-        best_cx = (best["box"][0] + best["box"][2]) / 2.0
-        best_cy = (best["box"][1] + best["box"][3]) / 2.0
+        raw_cx = (best["box"][0] + best["box"][2]) / 2.0
+        raw_cy = (best["box"][1] + best["box"][3]) / 2.0
 
-        # Update velocity history
+        # Reset Kalman on large jumps (teleport) to avoid filter divergence
+        if (self._kf_x is not None and self._frames_since <= 5):
+            kf_cx = float(self._kf_x[0, 0])
+            kf_cy = float(self._kf_x[1, 0])
+            if np.hypot(raw_cx - kf_cx, raw_cy - kf_cy) > BALL_MAX_TELEPORT_PX:
+                self._kf_x = None
+
+        self._kf_predict()
+        smooth_cx, smooth_cy = self._kf_update(raw_cx, raw_cy)
+
+        # Rebuild box around smoothed center using original box dimensions
+        bw = best["box"][2] - best["box"][0]
+        bh = best["box"][3] - best["box"][1]
+        smoothed_box = [
+            int(smooth_cx - bw / 2), int(smooth_cy - bh / 2),
+            int(smooth_cx + bw / 2), int(smooth_cy + bh / 2),
+        ]
+        best = dict(best)   # don't mutate the original
+        best["box"] = smoothed_box
+
+        # Update velocity history (using raw center to avoid Kalman feedback loop)
         if self._last_box is not None and self._frames_since <= 3:
             gap = max(1, self._frames_since)
-            vx = (best_cx - self._last_cx) / gap
-            vy = (best_cy - self._last_cy) / gap
+            vx = (raw_cx - self._last_cx) / gap
+            vy = (raw_cy - self._last_cy) / gap
             self._vel_history.append((vx, vy))
         elif self._frames_since > 10:
             self._vel_history.clear()
 
-        self._last_box = best["box"]
-        self._last_cx = best_cx
-        self._last_cy = best_cy
+        self._last_box = smoothed_box
+        self._last_cx = raw_cx
+        self._last_cy = raw_cy
         self._last_seen_frame = frame_idx
         return [best]
 
