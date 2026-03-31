@@ -22,19 +22,26 @@ from sahi import AutoDetectionModel
 from sahi.predict import get_sliced_prediction
 from ultralytics import YOLO
 
-# Reuse the actual classes and constants from the main pipeline
+# Reuse validator/tracker classes and ball constants from the main pipeline
 from main import (
     CLS_BALL, CLS_HOOP,
-    COCO_BALL_CLS, COCO_BALL_CONF,
-    SAHI_CONF_THRESH, SAHI_SLICE_SIZE, SAHI_OVERLAP_RATIO,
-    SAHI_CROP_PAD, SAHI_MAX_LOST,
     BALL_MAX_BBOX_AREA, BALL_MIN_BBOX_AREA,
     BALL_MAX_TELEPORT_PX,
     BallValidator, BallTracker,
-    build_court_roi, run_sahi_ball_targeted,
+    build_court_roi,
 )
 
-# Minimum confidence for fine-tuned YOLO ball detections (matches main pipeline)
+# SAHI constants (inlined here — SAHI was removed from main.py inference pipeline
+# but is still useful for auto-labeling since it improves label recall)
+SAHI_CROP_PAD      = 400    # pixels to pad around last known ball center for SAHI crop
+SAHI_CONF_THRESH   = 0.10   # lower conf OK — we're zooming into a small region
+SAHI_SLICE_SIZE    = 128    # smaller slices = more zoom on small ball
+SAHI_OVERLAP_RATIO = 0.35
+SAHI_MAX_LOST      = 60     # max frames since last ball sighting to run targeted SAHI
+COCO_BALL_CLS      = 32     # "sports ball" in COCO
+COCO_BALL_CONF     = 0.20
+
+# Minimum confidence for fine-tuned YOLO ball detections
 YOLO_BALL_CONF = 0.25
 
 
@@ -42,6 +49,48 @@ def get_device() -> str:
     if torch.cuda.is_available():
         return "cuda:0"
     return "cpu"
+
+
+def _run_sahi_ball_targeted(sahi_model, frame, center, existing_ball_dets):
+    """Run SAHI on a small crop around the ball's last known position."""
+    cx, cy = center
+    h, w = frame.shape[:2]
+
+    x1 = max(0, int(cx - SAHI_CROP_PAD))
+    y1 = max(0, int(cy - SAHI_CROP_PAD))
+    x2 = min(w, int(cx + SAHI_CROP_PAD))
+    y2 = min(h, int(cy + SAHI_CROP_PAD))
+
+    if x2 - x1 < 50 or y2 - y1 < 50:
+        return []
+
+    crop = frame[y1:y2, x1:x2]
+    result = get_sliced_prediction(
+        image=crop,
+        detection_model=sahi_model,
+        slice_height=SAHI_SLICE_SIZE,
+        slice_width=SAHI_SLICE_SIZE,
+        overlap_height_ratio=SAHI_OVERLAP_RATIO,
+        overlap_width_ratio=SAHI_OVERLAP_RATIO,
+        postprocess_type="NMS",
+        postprocess_match_threshold=0.40,
+        verbose=0,
+    )
+
+    sahi_balls = []
+    for pred in result.object_prediction_list:
+        if int(pred.category.id) != COCO_BALL_CLS:
+            continue
+        if pred.score.value < SAHI_CONF_THRESH:
+            continue
+        bb = pred.bbox
+        box = [int(bb.minx) + x1, int(bb.miny) + y1,
+               int(bb.maxx) + x1, int(bb.maxy) + y1]
+        sahi_balls.append({
+            "tid": -1, "box": box,
+            "cls": CLS_BALL, "conf": pred.score.value,
+        })
+    return sahi_balls
 
 
 def detect_ball_frame(model, sahi_model, frame, frame_idx,
@@ -72,7 +121,6 @@ def detect_ball_frame(model, sahi_model, frame, frame_idx,
                 w = box_list[2] - box_list[0]
                 h = box_list[3] - box_list[1]
                 area = w * h
-                # Aspect ratio check (ball is roughly circular)
                 if area < BALL_MIN_BBOX_AREA or area > BALL_MAX_BBOX_AREA:
                     continue
                 if max(w, h) / max(min(w, h), 1) > 1.8:
@@ -92,9 +140,8 @@ def detect_ball_frame(model, sahi_model, frame, frame_idx,
         frames_since = ball_tracker.frames_since_seen
 
         if center is not None and frames_since < SAHI_MAX_LOST:
-            sahi_balls = run_sahi_ball_targeted(
-                sahi_model, frame, center, ball_dets,
-                ball_cls_id=COCO_BALL_CLS)
+            sahi_balls = _run_sahi_ball_targeted(
+                sahi_model, frame, center, ball_dets)
             ball_dets.extend(sahi_balls)
         elif center is None or frames_since >= SAHI_MAX_LOST:
             # Full-frame SAHI every 5 frames when ball is lost
@@ -123,9 +170,7 @@ def detect_ball_frame(model, sahi_model, frame, frame_idx,
                     })
 
     # --- Apply the SAME filters as the main pipeline ---
-    # BallValidator: court boundary, teleport, backboard constraint
     ball_dets = ball_validator.filter(frame_idx, ball_dets, hoop_dets)
-    # BallTracker: pick best detection (confidence-based)
     ball_to_draw = ball_tracker.update(frame_idx, ball_dets)
 
     if not ball_to_draw:
@@ -158,7 +203,6 @@ def auto_label_video(video_path: str, output_dir: str,
     infer_imgsz = 1280 if device.startswith("cuda") else 640
     use_half = device.startswith("cuda")
 
-    # Load models
     print("Loading fine-tuned YOLO model ...")
     model = YOLO(weights)
     model.to(device)
@@ -171,18 +215,15 @@ def auto_label_video(video_path: str, output_dir: str,
         device=device,
     )
 
-    # Use the SAME validator + tracker as the main pipeline
     roi_poly = build_court_roi(frame_w, frame_h)
     ball_validator = BallValidator(roi_poly, frame_w, frame_h)
     ball_tracker = BallTracker()
 
-    # Output setup
     video_name = Path(video_path).stem
     out_path = Path(output_dir)
     frames_dir = out_path / "frames" / video_name
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    # Seek to start frame
     if start_frame > 0:
         cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
 
@@ -199,12 +240,10 @@ def auto_label_video(video_path: str, output_dir: str,
 
         frame_num = start_frame + i
 
-        # Save frame as image
         frame_filename = f"frame_{frame_num:06d}.jpg"
         frame_path = str(frames_dir / frame_filename)
         cv2.imwrite(frame_path, frame)
 
-        # Detect ball using full pipeline
         result = detect_ball_frame(
             model, sahi_model, frame, frame_num,
             frame_w, frame_h, device, infer_imgsz, use_half,
@@ -282,7 +321,6 @@ def relabel_existing_frames(frames_dir: str, output_dir: str,
             frame = cv2.imread(str(frame_file))
             if frame is None:
                 all_labels.append((str(frame_file), 0, -1, -1))
-                # Still update tracker so frames_since stays correct
                 ball_tracker.update(i, [])
                 continue
 

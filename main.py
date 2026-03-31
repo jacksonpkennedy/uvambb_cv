@@ -22,8 +22,6 @@ import cv2
 import easyocr
 import numpy as np
 import torch
-from sahi import AutoDetectionModel
-from sahi.predict import get_sliced_prediction
 from ultralytics import YOLO
 
 from tracknet import TrackNetInference
@@ -70,21 +68,10 @@ IOU_CRASH_THRESH   = 0.40
 VEL_HISTORY_LEN    = 15
 VEL_EXIT_THRESH    = 80
 
-# SAHI — targeted inference around ball's last known position
-SAHI_CROP_PAD      = 400    # pixels to pad around last known ball center for SAHI crop
-SAHI_CONF_THRESH   = 0.10   # lower conf OK — we're zooming into a small region
-SAHI_SLICE_SIZE    = 128    # smaller slices = more zoom on small ball
-SAHI_OVERLAP_RATIO = 0.35   # more overlap = less chance ball splits across slice edges
-SAHI_MAX_LOST      = 60     # max frames since last ball sighting to run targeted SAHI
-
 # TrackNet — heatmap-based ball detection using 3 consecutive frames
 TRACKNET_WEIGHTS     = "runs/tracknet/weights/best.pt"  # path to trained TrackNet weights
 TRACKNET_CONF_THRESH = 0.3                        # heatmap peak confidence threshold (lower for early training)
 TRACKNET_BALL_RADIUS = 15                          # pixels, for bbox synthesis from center point
-
-# COCO pretrained ball detection — used by SAHI fallback (class 32)
-COCO_BALL_CLS      = 32     # "sports ball" in COCO
-COCO_BALL_CONF     = 0.20   # confidence threshold for COCO ball detections
 
 # Jersey OCR
 OCR_INTERVAL       = 30     # run OCR every N frames (performance vs accuracy)
@@ -481,8 +468,8 @@ class TeamClassifier:
 class BallTracker:
     """Track ball detections — pick best detection per frame.
     Simplified for TrackNet: typically 1 detection per frame.
-    When multiple sources (TrackNet + SAHI), picks by confidence.
-    Stores last known position so SAHI can target that region."""
+    TrackNet is the sole ball detector; picks highest-confidence detection
+    and maintains velocity history for the interpolator."""
 
     _VEL_HISTORY = 5       # frames of velocity history to average
 
@@ -854,68 +841,6 @@ class BallValidator:
 
 
 # ---------------------------------------------------------------------------
-# SAHI — targeted inference around ball's last known position
-# ---------------------------------------------------------------------------
-
-def run_sahi_ball_targeted(
-    sahi_model: AutoDetectionModel,
-    frame: np.ndarray,
-    center: tuple,
-    existing_ball_dets: list,
-    ball_cls_id: int = COCO_BALL_CLS,
-) -> list:
-    """Run SAHI on a small crop around the ball's last known position.
-    Much faster than full-frame slicing — only processes the region
-    where the ball is likely to be."""
-    cx, cy = center
-    h, w = frame.shape[:2]
-
-    # Crop region around last known ball center
-    x1 = max(0, int(cx - SAHI_CROP_PAD))
-    y1 = max(0, int(cy - SAHI_CROP_PAD))
-    x2 = min(w, int(cx + SAHI_CROP_PAD))
-    y2 = min(h, int(cy + SAHI_CROP_PAD))
-
-    if x2 - x1 < 50 or y2 - y1 < 50:
-        return []
-
-    crop = frame[y1:y2, x1:x2]
-
-    result = get_sliced_prediction(
-        image=crop,
-        detection_model=sahi_model,
-        slice_height=SAHI_SLICE_SIZE,
-        slice_width=SAHI_SLICE_SIZE,
-        overlap_height_ratio=SAHI_OVERLAP_RATIO,
-        overlap_width_ratio=SAHI_OVERLAP_RATIO,
-        postprocess_type="NMS",
-        postprocess_match_threshold=0.40,
-        verbose=0,
-    )
-
-    sahi_balls: list = []
-    for pred in result.object_prediction_list:
-        if int(pred.category.id) != ball_cls_id:
-            continue
-        if pred.score.value < SAHI_CONF_THRESH:
-            continue
-        bb = pred.bbox
-        # Remap crop coordinates back to full frame
-        box = [int(bb.minx) + x1, int(bb.miny) + y1,
-               int(bb.maxx) + x1, int(bb.maxy) + y1]
-        # Skip if it largely overlaps an existing ball detection
-        dup = False
-        for ed in existing_ball_dets:
-            if bbox_iou(box, ed["box"]) > 0.30:
-                dup = True
-                break
-        if not dup:
-            sahi_balls.append({"tid": -1, "box": box, "cls": CLS_BALL, "conf": pred.score.value})
-
-    return sahi_balls
-
-
-# ---------------------------------------------------------------------------
 # Court ROI — polygon check
 # ---------------------------------------------------------------------------
 
@@ -1272,7 +1197,7 @@ def _load_model(pt_path: str, imgsz: int, label: str) -> YOLO:
 
 @torch.inference_mode()
 def run(video_path: str, out_dir: str, weights: str | None = None,
-        use_sahi: bool = True, use_tracknet: bool = True,
+        use_tracknet: bool = True,
         tracknet_weights: str | None = None):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
@@ -1318,17 +1243,6 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
             tn_weights, device=device,
             conf_thresh=TRACKNET_CONF_THRESH,
             ball_radius=TRACKNET_BALL_RADIUS,
-        )
-
-    # SAHI — sliced inference fallback for ball detection
-    sahi_model = None
-    if use_sahi:
-        print("Loading SAHI sliced-inference model (COCO sports ball) ...")
-        sahi_model = AutoDetectionModel.from_pretrained(
-            model_type="yolov8",          # compatible with YOLO11
-            model_path="yolo11s.pt",      # COCO pretrained — sports ball class
-            confidence_threshold=SAHI_CONF_THRESH,
-            device=device,
         )
 
     roi_poly      = build_court_roi(frame_w, frame_h)
@@ -1458,42 +1372,6 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                 ball_dets.append(tn_det)
                 ball_source = "TrackNet"
 
-        # ---- 1b. SAHI fallback — when TrackNet misses the ball ----------------
-        if sahi_model is not None and not ball_dets:
-            center = ball_tracker.last_center
-            if center is not None and ball_tracker.frames_since_seen < SAHI_MAX_LOST:
-                # COCO SAHI — sports ball class
-                sahi_balls = run_sahi_ball_targeted(
-                    sahi_model, frame, center, ball_dets,
-                    ball_cls_id=COCO_BALL_CLS)
-                ball_dets.extend(sahi_balls)
-            elif center is None or ball_tracker.frames_since_seen >= SAHI_MAX_LOST:
-                # No prior position or ball lost too long — run full-frame SAHI
-                # every 5 frames to re-acquire without killing performance
-                if frame_idx % 5 == 0:
-                    result = get_sliced_prediction(
-                        image=frame,
-                        detection_model=sahi_model,
-                        slice_height=320,
-                        slice_width=320,
-                        overlap_height_ratio=0.25,
-                        overlap_width_ratio=0.25,
-                        postprocess_type="NMS",
-                        postprocess_match_threshold=0.40,
-                        verbose=0,
-                    )
-                    for pred in result.object_prediction_list:
-                        if int(pred.category.id) != COCO_BALL_CLS:
-                            continue
-                        if pred.score.value < SAHI_CONF_THRESH:
-                            continue
-                        bb = pred.bbox
-                        box = [int(bb.minx), int(bb.miny),
-                               int(bb.maxx), int(bb.maxy)]
-                        ball_dets.append({"tid": -1, "box": box, "cls": CLS_BALL, "conf": pred.score.value})
-            if ball_dets:
-                ball_source = "SAHI"
-
         # ---- 2. Re-ID + memory + velocity ------------------------------------
         raw_dets              = reid_buffer.update(frame_idx, raw_dets)
         real_dets, ghost_dets = memory.update(frame_idx, raw_dets)
@@ -1611,10 +1489,8 @@ if __name__ == "__main__":
                         help="Train on data/custom_annotations/ then run inference")
     parser.add_argument("--epochs",   type=int, default=50)
     parser.add_argument("--batch",    type=int, default=16)
-    parser.add_argument("--no-sahi",  action="store_true",
-                        help="Disable SAHI sliced inference for ball detection")
     parser.add_argument("--no-tracknet", action="store_true",
-                        help="Disable TrackNet ball detection (fall back to SAHI only)")
+                        help="Disable TrackNet ball detection")
     parser.add_argument("--tracknet-weights", default=None,
                         help="Path to TrackNet weights (default: tracknet_basketball.pt)")
     parser.add_argument("--finetune-tracknet", action="store_true",
@@ -1626,7 +1502,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run_kwargs = dict(
-        use_sahi=not args.no_sahi,
         use_tracknet=not args.no_tracknet,
         tracknet_weights=args.tracknet_weights,
     )
