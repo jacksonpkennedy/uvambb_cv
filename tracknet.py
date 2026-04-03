@@ -14,9 +14,10 @@ Usage:
 
 import argparse
 import csv
+import gc
 import math
-import os
 import random as pyrandom
+
 from collections import deque
 from pathlib import Path
 
@@ -36,13 +37,13 @@ INPUT_W, INPUT_H = 640, 360    # TrackNet canonical resolution
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, pad=1,
-                 stride=1, bias=True):
+                 stride=1, bias=False):
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size,
                       stride=stride, padding=pad, bias=bias),
-            nn.ReLU(),
             nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
@@ -77,14 +78,14 @@ class TrackNetV3(nn.Module):
         self.conv6 = ConvBlock(256, 256)
         self.conv7 = ConvBlock(256, 256)        # → skip3 (256ch, /4 res)
         self.pool3 = nn.MaxPool2d(2, 2)
-        self.conv8 = ConvBlock(256, 512)
-        self.conv9 = ConvBlock(512, 512)
-        self.conv10 = ConvBlock(512, 512)       # bottleneck (512ch, /8 res)
+        self.conv8 = ConvBlock(256, 256)
+        self.conv9 = ConvBlock(256, 256)
+        self.conv10 = ConvBlock(256, 256)       # bottleneck (256ch, /8 res)
 
         # --- Decoder (with skip connections) ---
-        # After ups1: 512ch. cat with skip3(256ch) → 768ch
+        # After ups1: 256ch. cat with skip3(256ch) → 512ch
         self.ups1 = nn.Upsample(scale_factor=2)
-        self.conv11 = ConvBlock(768, 256)
+        self.conv11 = ConvBlock(512, 256)
         self.conv12 = ConvBlock(256, 256)
         self.conv13 = ConvBlock(256, 256)
         # After ups2: 256ch. cat with skip2(128ch) → 384ch
@@ -119,7 +120,7 @@ class TrackNetV3(nn.Module):
         x = self.conv10(x)
 
         x = self.ups1(x)
-        x = torch.cat([x, skip3], dim=1)        # 512+256=768
+        x = torch.cat([x, skip3], dim=1)        # 256+256=512
         x = self.conv11(x)
         x = self.conv12(x)
         x = self.conv13(x)
@@ -132,15 +133,13 @@ class TrackNetV3(nn.Module):
         x = self.conv16(x)
         x = self.conv17(x)
         x = self.conv18(x)
-
-        if self.training:
-            return x                            # raw logits for bce_with_logits
-        return torch.sigmoid(x)                 # (B, 1, H, W) in [0, 1]
+        return x                                # always raw logits
 
     def _init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.uniform_(m.weight, -0.05, 0.05)
+                nn.init.kaiming_normal_(m.weight, mode="fan_out",
+                                        nonlinearity="relu")
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
@@ -219,15 +218,25 @@ def generate_heatmap(cx: int, cy: int, w: int = INPUT_W, h: int = INPUT_H,
     Sigma=3.16 = sqrt(10) per TrackNetV1 paper (sigma^2=10).
     FWHM ≈ 2.35 * 3.16 ≈ 7.4px at model resolution 640x360.
 
+    Uses a small patch (4σ radius) instead of a full meshgrid — ~100x fewer
+    exponentials per call. Called 23K+ times per epoch so this matters.
+
     Returns (h, w) float32 array with values in [0, 1].
     """
     if cx < 0 or cy < 0:
         return np.zeros((h, w), dtype=np.float32)
 
-    xs = np.arange(w, dtype=np.float32)
-    ys = np.arange(h, dtype=np.float32)
+    hmap = np.zeros((h, w), dtype=np.float32)
+    radius = int(4 * sigma + 0.5)  # beyond 4σ the Gaussian is < 0.0003
+    x0 = max(0, cx - radius)
+    x1 = min(w, cx + radius + 1)
+    y0 = max(0, cy - radius)
+    y1 = min(h, cy + radius + 1)
+    xs = np.arange(x0, x1, dtype=np.float32)
+    ys = np.arange(y0, y1, dtype=np.float32)
     xx, yy = np.meshgrid(xs, ys)
-    hmap = np.exp(-((xx - cx)**2 + (yy - cy)**2) / (2 * sigma**2))
+    hmap[y0:y1, x0:x1] = np.exp(-((xx - cx)**2 + (yy - cy)**2)
+                                  / (2 * sigma**2))
     return hmap
 
 
@@ -254,8 +263,12 @@ def focal_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
                  * torch.pow(pred, 2.0)
                  * torch.log((1.0 - pred).clamp(min=1e-6))) * neg_mask
 
-    num_pos = pos_mask.sum().clamp(min=1)
-    return (pos_loss.sum() + neg_loss.sum()) / num_pos
+    # pos_loss: normalise by number of ball pixels (few → high weight per pixel)
+    # neg_loss: normalise by total pixels (mean) — avoids explosion from the
+    #           millions of background pixels dwarfing the small num_pos divisor
+    num_pos   = pos_mask.sum().clamp(min=1)
+    num_total = float(pred.numel())
+    return pos_loss.sum() / num_pos + neg_loss.sum() / num_total
 
 
 # ---------------------------------------------------------------------------
@@ -265,20 +278,23 @@ def focal_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 def evaluate_pe(model: "TrackNetV3", loader, device: str,
                 pe_thresh: float = 5.0,
                 conf_thresh: float = 0.5) -> dict:
-    """Compute precision, recall, F1 at PE≤5px threshold (paper standard).
+    """Compute val_loss + precision/recall/F1 in a single val pass.
 
     TP: model predicts ball AND predicted center ≤ pe_thresh px from GT.
     FP: model predicts ball but no GT, or distance > pe_thresh.
     FN: model predicts no ball but GT exists.
     """
     tp = fp = fn = 0
+    total_loss = 0.0
     model.eval()
     use_amp = device != "cpu"
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
         for inp, target, vis_flags in loader:
             inp    = inp.to(device, non_blocking=True)
-            out    = model(inp)          # (B, 1, H, W) sigmoid
-            pred_np   = out.cpu().numpy()
+            target = target.to(device, non_blocking=True)
+            out    = model(inp)          # (B, 1, H, W) logits
+            total_loss += focal_loss(out, target).item()
+            pred_np   = torch.sigmoid(out).cpu().numpy()
             target_np = target.cpu().numpy()
             vis_np    = vis_flags.cpu().numpy()
             for b in range(pred_np.shape[0]):
@@ -304,11 +320,12 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
                     fp += 1
                 elif has_ball:
                     fn += 1
+    avg_loss = total_loss / max(len(loader), 1)
     prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-    return {"precision": prec, "recall": rec, "f1": f1,
-            "tp": tp, "fp": fp, "fn": fn}
+    return {"val_loss": avg_loss, "precision": prec, "recall": rec,
+            "f1": f1, "tp": tp, "fp": fp, "fn": fn}
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +352,7 @@ class TrackNetDataset(Dataset):
     datasets (40K+ frames) that won't fit in RAM.
     """
 
-    def __init__(self, csv_path: str, sigma: float = 2.5,
+    def __init__(self, csv_path: str, sigma: float = 3.16,
                  oversample_visible: bool = False,
                  augment: bool = False):
         self.sigma = sigma
@@ -441,12 +458,9 @@ class TrackNetDataset(Dataset):
             cx, cy = -1.0, -1.0
 
         # --- Augmentation ---
-        flip = False
-        brightness = 1.0
         if self.augment:
             # Horizontal flip (50%)
             if pyrandom.random() < 0.5:
-                flip = True
                 f0 = np.flip(f0, axis=2).copy()
                 f1 = np.flip(f1, axis=2).copy()
                 f2 = np.flip(f2, axis=2).copy()
@@ -454,29 +468,25 @@ class TrackNetDataset(Dataset):
                     cx = INPUT_W - 1 - cx
 
             # Brightness jitter [0.7, 1.3]
-            brightness = pyrandom.uniform(0.7, 1.3)
-            f0 = np.clip(f0 * brightness, 0.0, 1.0)
-            f1 = np.clip(f1 * brightness, 0.0, 1.0)
-            f2 = np.clip(f2 * brightness, 0.0, 1.0)
+            b = pyrandom.uniform(0.7, 1.3)
+            f0 = np.clip(f0 * b, 0.0, 1.0)
+            f1 = np.clip(f1 * b, 0.0, 1.0)
+            f2 = np.clip(f2 * b, 0.0, 1.0)
 
-            # Gaussian noise (std=0.02)
-            noise = np.random.normal(0, 0.02, f2.shape).astype(np.float32)
-            f0 = np.clip(f0 + noise, 0.0, 1.0)
-            f1 = np.clip(f1 + noise, 0.0, 1.0)
-            f2 = np.clip(f2 + noise, 0.0, 1.0)
+            # Independent Gaussian noise per frame (std=0.02)
+            # Different noise per frame so diff channels learn noise robustness
+            f0 = np.clip(f0 + np.random.normal(0, 0.02, f0.shape).astype(np.float32), 0.0, 1.0)
+            f1 = np.clip(f1 + np.random.normal(0, 0.02, f1.shape).astype(np.float32), 0.0, 1.0)
+            f2 = np.clip(f2 + np.random.normal(0, 0.02, f2.shape).astype(np.float32), 0.0, 1.0)
 
             # Motion blur (30% chance) — simulates fast ball during shots/passes
-            # Randomly horizontal or vertical kernel (ball moves in both directions)
             if pyrandom.random() < 0.3:
                 ksize = pyrandom.choice([5, 7, 9, 11])
+                kernel = np.zeros((ksize, ksize), dtype=np.float32)
                 if pyrandom.random() < 0.5:
-                    kernel = np.zeros((ksize, ksize), dtype=np.float32)
                     kernel[ksize // 2, :] = 1.0 / ksize   # horizontal
                 else:
-                    kernel = np.zeros((ksize, ksize), dtype=np.float32)
                     kernel[:, ksize // 2] = 1.0 / ksize   # vertical
-                # Apply only to f2 (target frame) — blur simulates the ball mid-flight
-                # Transpose to (H,W,3) for cv2.filter2D, then back to (3,H,W)
                 f2_hwc = np.transpose(f2, (1, 2, 0))
                 f2_hwc = cv2.filter2D(f2_hwc, -1, kernel)
                 f2 = np.transpose(f2_hwc, (2, 0, 1)).astype(np.float32)
@@ -501,40 +511,21 @@ class TrackNetDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# Mixup collation helper
-# ---------------------------------------------------------------------------
-
-class MixupCollate:
-    """Collate function with mixup augmentation — picklable for multiprocessing."""
-
-    def __init__(self, alpha: float = 0.5):
-        self.alpha = alpha
-
-    def __call__(self, batch):
-        inps, hmaps, vis_flags = zip(*batch)
-        inps      = torch.stack(inps)
-        hmaps     = torch.stack(hmaps)
-        vis_flags = torch.stack(vis_flags)
-
-        if self.alpha > 0 and pyrandom.random() < 0.5:
-            lam = np.random.beta(self.alpha, self.alpha)
-            idx = torch.randperm(inps.size(0))
-            inps  = lam * inps  + (1 - lam) * inps[idx]
-            hmaps = lam * hmaps + (1 - lam) * hmaps[idx]
-
-        return inps, hmaps, vis_flags
-
-
-# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
-def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
-                   lr: float = 1e-3, device: str = "cuda:0",
+def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
+                   device: str = "cuda:0",
                    output_dir: str = "runs/tracknet/weights",
-                   num_workers: int = 4,
-                   resume: bool = False):
-    """Train TrackNetV3 on basketball frame sequences."""
+                   num_workers: int = 0,
+                   resume: bool = False,
+                   accum_steps: int = 2):
+    """Train TrackNetV3 on basketball frame sequences.
+
+    Args:
+        accum_steps: gradient accumulation steps. Effective batch size is
+                     batch_size * accum_steps (default 8*2=16).
+    """
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -542,13 +533,10 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
     val_csv   = str(Path(data_dir) / "val.csv")
 
     print("Building training dataset ...")
-    train_ds = TrackNetDataset(train_csv, sigma=3.16,
-                               oversample_visible=True, augment=True)
-    val_ds   = (TrackNetDataset(val_csv, sigma=3.16, augment=False)
+    train_ds = TrackNetDataset(train_csv, oversample_visible=True, augment=True)
+    val_ds   = (TrackNetDataset(val_csv, augment=False)
                 if Path(val_csv).exists() else None)
 
-    # Lazy loading: use num_workers for parallel disk I/O
-    # persistent_workers keeps worker processes alive between epochs
     _pw = num_workers > 0
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
@@ -556,7 +544,6 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
         pin_memory=(device != "cpu"),
         persistent_workers=_pw,
         prefetch_factor=2 if _pw else None,
-        collate_fn=MixupCollate(alpha=0.5),
     )
     val_loader = (DataLoader(
         val_ds, batch_size=batch_size, shuffle=False,
@@ -566,8 +553,11 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
         prefetch_factor=2 if _pw else None,
     ) if val_ds else None)
 
+    # cuDNN benchmark: caches fastest conv algorithm for fixed input size.
+    # Free 10-20% speedup since every input is always 640×360.
+    torch.backends.cudnn.benchmark = True
+
     model = TrackNetV3().to(device)
-    # torch.compile requires Triton which is Linux-only — skip on Windows
     import platform
     if platform.system() != "Windows":
         try:
@@ -577,29 +567,20 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
             print(f"  torch.compile: skipped ({e})")
     else:
         print("  torch.compile: skipped (Windows/no Triton)")
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    # OneCycleLR: warm-up for 30% of training then cosine-anneal to min_lr.
-    # Step per batch (not per epoch) for smooth LR curve.
-    # Must be recreated with correct steps_per_epoch BEFORE loading checkpoint.
-    _steps_per_epoch = len(train_loader)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=3e-4,
-        epochs=epochs,
-        steps_per_epoch=_steps_per_epoch,
-        pct_start=0.3,
-        anneal_strategy="cos",
-        div_factor=25.0,
-        final_div_factor=1e4,
-    )
+
+    # AdamW: decoupled weight decay generalises better than L2 in Adam
+    # (Loshchilov & Hutter 2019), especially with cosine schedulers.
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4,
+                                  weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6)
 
     use_amp = device != "cpu"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    best_val_loss  = float("inf")
     best_f1        = 0.0
     no_improve     = 0       # epochs since best F1 improved
-    early_stop_pat = 15      # stop if no F1 improvement for this many epochs
+    early_stop_pat = 15
     start_epoch    = 0
 
     # Resume from last checkpoint if requested
@@ -610,103 +591,87 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 16,
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
-        start_epoch   = ckpt["epoch"] + 1
-        best_val_loss = ckpt.get("best_val_loss", float("inf"))
-        best_f1       = ckpt.get("best_f1", 0.0)
-        no_improve    = ckpt.get("no_improve", 0)
+        start_epoch = ckpt["epoch"] + 1
+        best_f1     = ckpt.get("best_f1", 0.0)
+        no_improve  = ckpt.get("no_improve", 0)
         print(f"  Resumed from epoch {start_epoch} "
               f"(best_f1={best_f1:.3f}, no_improve={no_improve})")
     elif resume:
         print("  No checkpoint found — starting from scratch")
 
+    eff_batch = batch_size * accum_steps
+    print(f"  batch={batch_size} x accum={accum_steps} → effective batch {eff_batch}")
+    print(f"  AMP fp16: {'enabled' if use_amp else 'disabled'}")
+
     for epoch in range(start_epoch, epochs):
         # --- Train ---
         model.train()
         train_loss = 0.0
+        optimizer.zero_grad(set_to_none=True)
+
         for batch_idx, (inp, target, _vis) in enumerate(train_loader):
             inp    = inp.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 out  = model(inp)
-                loss = focal_loss(out, target)
+                loss = focal_loss(out, target) / accum_steps
 
-            optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
-            # Gradient clipping prevents exploding gradients on hard samples
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
 
-            train_loss += loss.item()
+            # Step optimizer every accum_steps batches (or at end of epoch)
+            if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(train_loader):
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
 
-            if batch_idx % 10 == 0:
+            train_loss += loss.item() * accum_steps  # undo the /accum_steps for logging
+
+            if batch_idx % 20 == 0:
                 print(f"  Epoch {epoch+1}/{epochs}  "
                       f"batch {batch_idx}/{len(train_loader)}  "
-                      f"loss={loss.item():.4f}")
+                      f"loss={loss.item() * accum_steps:.4f}")
 
         avg_train = train_loss / max(len(train_loader), 1)
 
-        # --- Validate ---
-        avg_val = float("inf")
-        if val_loader:
-            model.eval()
-            val_loss = 0.0
-            with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-                for inp, target, _vis in val_loader:
-                    inp    = inp.to(device, non_blocking=True)
-                    target = target.to(device, non_blocking=True)
-                    out    = model(inp)
-                    loss   = focal_loss(out, target)
-                    val_loss += loss.item()
-            avg_val = val_loss / max(len(val_loader), 1)
-
+        # --- Validate + PE metric in a single pass ---
         if val_loader:
             pe = evaluate_pe(model, val_loader, device,
                              pe_thresh=5.0, conf_thresh=0.5)
             print(f"Epoch {epoch+1}/{epochs}  "
-                  f"train_loss={avg_train:.4f}  val_loss={avg_val:.4f}  "
+                  f"train_loss={avg_train:.4f}  val_loss={pe['val_loss']:.4f}  "
                   f"prec={pe['precision']:.3f}  rec={pe['recall']:.3f}  "
                   f"F1={pe['f1']:.3f}  "
                   f"(TP={pe['tp']} FP={pe['fp']} FN={pe['fn']})")
-            # Track best F1 for early stopping (more reliable than val loss
-            # because val loss is dominated by the many empty frames)
             if pe["f1"] > best_f1:
                 best_f1    = pe["f1"]
                 no_improve = 0
                 torch.save(model.state_dict(), str(out_path / "best.pt"))
-                print(f"  → Saved best model (F1={best_f1:.3f})")
+                print(f"  -> Saved best model (F1={best_f1:.3f})")
             else:
                 no_improve += 1
                 print(f"  No F1 improvement ({no_improve}/{early_stop_pat})")
         else:
-            print(f"Epoch {epoch+1}/{epochs}  "
-                  f"train_loss={avg_train:.4f}  val_loss={avg_val:.4f}")
+            print(f"Epoch {epoch+1}/{epochs}  train_loss={avg_train:.4f}")
 
-        # Save best model weights by val loss (fallback when no val PE available)
-        if not val_loader and avg_val < best_val_loss:
-            best_val_loss = avg_val
-            torch.save(model.state_dict(), str(out_path / "best.pt"))
-            print(f"  → Saved best model (val_loss={avg_val:.4f})")
+        scheduler.step()
 
-        # Save full resumable checkpoint (weights + optimizer + scheduler + epoch)
+        # Save resumable checkpoint
         torch.save({
-            "epoch":          epoch,
-            "model":          model.state_dict(),
-            "optimizer":      optimizer.state_dict(),
-            "scheduler":      scheduler.state_dict(),
-            "scaler":         scaler.state_dict(),
-            "best_val_loss":  best_val_loss,
-            "best_f1":        best_f1,
-            "no_improve":     no_improve,
+            "epoch":      epoch,
+            "model":      model.state_dict(),
+            "optimizer":  optimizer.state_dict(),
+            "scheduler":  scheduler.state_dict(),
+            "scaler":     scaler.state_dict(),
+            "best_f1":    best_f1,
+            "no_improve": no_improve,
         }, str(out_path / "last_ckpt.pt"))
-        # Also save bare weights for inference
-        torch.save(model.state_dict(), str(out_path / "last.pt"))
 
-        # Early stopping — based on F1 since val loss is unreliable with
-        # class-imbalanced data (empty frames dominate)
+        gc.collect()
+        torch.cuda.empty_cache()
+
         if val_loader and no_improve >= early_stop_pat:
             print(f"\nEarly stopping: F1 hasn't improved for "
                   f"{early_stop_pat} epochs (best F1={best_f1:.3f})")
@@ -885,16 +850,17 @@ if __name__ == "__main__":
     parser.add_argument("--train", action="store_true",
                         help="Train TrackNet on basketball data")
     parser.add_argument("--preprocess", action="store_true",
-                        help="Pre-resize all frames to 640×360 for faster training")
+                        help="Pre-resize all frames to 640x360 for faster training")
     parser.add_argument("--data", default="data/tracknet_labels/",
                         help="Directory containing train.csv / val.csv")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch", type=int, default=32,
-                        help="Batch size (default 32 — RTX 4070 fits ~32 at fp16)")
-    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--batch", type=int, default=8,
+                        help="Batch size per step (default 8, effective 16 with accum=2)")
+    parser.add_argument("--accum", type=int, default=2,
+                        help="Gradient accumulation steps (effective batch = batch * accum)")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--workers", type=int, default=8,
-                        help="DataLoader num_workers (default 8)")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="DataLoader num_workers (default 0 for Windows)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from last_ckpt.pt checkpoint")
     args = parser.parse_args()
@@ -903,7 +869,8 @@ if __name__ == "__main__":
         preprocess_frames(args.data)
     elif args.train:
         train_tracknet(args.data, epochs=args.epochs, batch_size=args.batch,
-                       lr=args.lr, device=args.device,
-                       num_workers=args.workers, resume=args.resume)
+                       device=args.device,
+                       num_workers=args.workers, resume=args.resume,
+                       accum_steps=args.accum)
     else:
         print("Use --train or --preprocess. See --help for options.")
