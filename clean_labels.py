@@ -19,8 +19,8 @@ from ultralytics import YOLO
 
 # Must match the ball class ID used in your fine-tuned YOLO model
 CLS_BALL = 0
-VERIFY_CONF = 0.50      # minimum YOLO confidence to trust a label
-VERIFY_DIST_PX = 30.0   # max distance (px) between YOLO detection and label
+VERIFY_CONF = 0.25      # minimum YOLO confidence to trust a label
+VERIFY_DIST_PX = 50.0   # max distance (px) between YOLO detection and label
 
 
 def clean_csv(csv_path: str, model: YOLO, device: str) -> dict:

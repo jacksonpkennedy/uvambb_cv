@@ -2,7 +2,7 @@
 TrackNet-style ball tracker — encoder-decoder heatmap regression for small ball detection.
 
 Architecture based on TrackNetV3 with U-Net skip connections:
-  - Input: 3 consecutive RGB frames + 2 motion diff maps → 11-channel tensor (640×360)
+  - Input: 3 consecutive RGB frames + 2 motion diff maps ->11-channel tensor (640×360)
   - Output: 1-channel sigmoid heatmap
   - Ball location: extracted via weighted centroid of peak region
 
@@ -69,30 +69,30 @@ class TrackNetV3(nn.Module):
 
         # --- Encoder ---
         self.conv1 = ConvBlock(11, 64)   # 9 RGB + 2 motion diff maps (V4)
-        self.conv2 = ConvBlock(64, 64)          # → skip1 (64ch, full res)
+        self.conv2 = ConvBlock(64, 64)          # ->skip1 (64ch, full res)
         self.pool1 = nn.MaxPool2d(2, 2)
         self.conv3 = ConvBlock(64, 128)
-        self.conv4 = ConvBlock(128, 128)        # → skip2 (128ch, /2 res)
+        self.conv4 = ConvBlock(128, 128)        # ->skip2 (128ch, /2 res)
         self.pool2 = nn.MaxPool2d(2, 2)
         self.conv5 = ConvBlock(128, 256)
         self.conv6 = ConvBlock(256, 256)
-        self.conv7 = ConvBlock(256, 256)        # → skip3 (256ch, /4 res)
+        self.conv7 = ConvBlock(256, 256)        # ->skip3 (256ch, /4 res)
         self.pool3 = nn.MaxPool2d(2, 2)
         self.conv8 = ConvBlock(256, 256)
         self.conv9 = ConvBlock(256, 256)
         self.conv10 = ConvBlock(256, 256)       # bottleneck (256ch, /8 res)
 
         # --- Decoder (with skip connections) ---
-        # After ups1: 256ch. cat with skip3(256ch) → 512ch
+        # After ups1: 256ch. cat with skip3(256ch) ->512ch
         self.ups1 = nn.Upsample(scale_factor=2)
         self.conv11 = ConvBlock(512, 256)
         self.conv12 = ConvBlock(256, 256)
         self.conv13 = ConvBlock(256, 256)
-        # After ups2: 256ch. cat with skip2(128ch) → 384ch
+        # After ups2: 256ch. cat with skip2(128ch) ->384ch
         self.ups2 = nn.Upsample(scale_factor=2)
         self.conv14 = ConvBlock(384, 128)
         self.conv15 = ConvBlock(128, 128)
-        # After ups3: 128ch. cat with skip1(64ch) → 192ch
+        # After ups3: 128ch. cat with skip1(64ch) ->192ch
         self.ups3 = nn.Upsample(scale_factor=2)
         self.conv16 = ConvBlock(192, 64)
         self.conv17 = ConvBlock(64, 64)
@@ -145,6 +145,12 @@ class TrackNetV3(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+        # Output layer produces raw logits — near-zero init keeps initial
+        # predictions close to sigmoid(0)=0.5 instead of the extreme values
+        # (0.01 or 0.99) that Kaiming init produces, avoiding massive initial
+        # loss from the (pred^2 * log(1-pred)) term on background pixels.
+        nn.init.normal_(self.conv18.weight, mean=0, std=0.001)
+        nn.init.constant_(self.conv18.bias, -2.0)  # sigmoid(-2)=0.12, conservative no-ball prior
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +161,7 @@ def postprocess_heatmap(heatmap: np.ndarray,
                         scale_x: float = 1.0,
                         scale_y: float = 1.0,
                         local_radius: int = 10) -> tuple:
-    """Convert sigmoid heatmap → ball center (x, y, conf) in original coords.
+    """Convert sigmoid heatmap ->ball center (x, y, conf) in original coords.
 
     Finds the global peak, then computes a weighted centroid in a local window
     around that peak. This prevents drifting between two competing hot spots
@@ -172,7 +178,7 @@ def postprocess_heatmap(heatmap: np.ndarray,
     """
     if heatmap.ndim == 3:
         heatmap = heatmap[0]
-    heatmap = heatmap.reshape(INPUT_H, INPUT_W)
+    heatmap = heatmap.reshape(INPUT_H, INPUT_W).astype(np.float32)
 
     # Slight blur to suppress single-pixel noise before finding peak
     heatmap = cv2.GaussianBlur(heatmap, (5, 5), 1.0)
@@ -245,17 +251,19 @@ def generate_heatmap(cx: int, cy: int, w: int = INPUT_W, h: int = INPUT_H,
 # ---------------------------------------------------------------------------
 
 def focal_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """CenterNet focal loss for heatmap regression.
+    """CenterNet focal loss (Zhou et al. 2019, Objects as Points).
 
-    For ball pixels (GT > 0): penalises by (1-pred)^2 so confident correct
-    predictions are down-weighted.
-    For background pixels: penalises by (1-GT)^4 * pred^2 so near-GT pixels
-    (which are almost-ball by the Gaussian spread) are treated leniently.
-    Normalised by number of positive pixels to remain scale-stable.
+    Positive = only the peak pixel(s) where target == 1. The Gaussian decay
+    around the peak is handled by the negative term's (1-Y)^4 weighting,
+    which gracefully reduces the penalty near the center.
+
+    Each term is averaged over its own pixel count so that the ~4 positive
+    pixels aren't drowned out by ~1.8M negative pixels.
     """
     pred = torch.sigmoid(pred_logits)
-    pos_mask = (target >= 0.01).float()
-    neg_mask = 1.0 - pos_mask
+    # Paper: positive = only the peak (Y == 1), not the full Gaussian blob.
+    pos_mask = (target >= 0.9999).float()
+    neg_mask = (target < 0.9999).float()
 
     pos_loss = -(torch.pow(1.0 - pred, 2.0)
                  * torch.log(pred.clamp(min=1e-6))) * pos_mask
@@ -263,12 +271,9 @@ def focal_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
                  * torch.pow(pred, 2.0)
                  * torch.log((1.0 - pred).clamp(min=1e-6))) * neg_mask
 
-    # pos_loss: normalise by number of ball pixels (few → high weight per pixel)
-    # neg_loss: normalise by total pixels (mean) — avoids explosion from the
-    #           millions of background pixels dwarfing the small num_pos divisor
-    num_pos   = pos_mask.sum().clamp(min=1)
-    num_total = float(pred.numel())
-    return pos_loss.sum() / num_pos + neg_loss.sum() / num_total
+    num_pos = pos_mask.sum().clamp(min=1)
+    num_neg = neg_mask.sum().clamp(min=1)
+    return pos_loss.sum() / num_pos + neg_loss.sum() / num_neg
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +338,7 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
 # ---------------------------------------------------------------------------
 
 def _parse_frame_number(path: str) -> int:
-    """Extract frame number from path like .../frame_000123.jpg → 123."""
+    """Extract frame number from path like .../frame_000123.jpg ->123."""
     stem = Path(path).stem
     parts = stem.split("_")
     try:
@@ -354,7 +359,8 @@ class TrackNetDataset(Dataset):
 
     def __init__(self, csv_path: str, sigma: float = 3.16,
                  oversample_visible: bool = False,
-                 augment: bool = False):
+                 augment: bool = False,
+                 data_root: str | None = None):
         self.sigma = sigma
         self.augment = augment
         self.entries = []       # list of (path, vis, x, y)
@@ -363,8 +369,14 @@ class TrackNetDataset(Dataset):
         with open(csv_path, "r") as f:
             reader = csv.DictReader(f)
             for row in reader:
+                fp = row["frame_path"]
+                # Remap relative 'data\...' paths to an external data_root
+                if data_root is not None:
+                    fp = fp.replace("\\", "/")
+                    if fp.startswith("data/"):
+                        fp = str(Path(data_root) / fp[len("data/"):])
                 self.entries.append((
-                    row["frame_path"],
+                    fp,
                     int(row["visibility"]),
                     float(row["x"]) if row["visibility"] != "0" else -1.0,
                     float(row["y"]) if row["visibility"] != "0" else -1.0,
@@ -399,22 +411,23 @@ class TrackNetDataset(Dataset):
                 empty_seqs.append(seq)
 
         if oversample_visible and visible_seqs:
-            repeat = max(1, len(empty_seqs) // max(len(visible_seqs), 1))
+            # Balance to ~50/50 visible vs empty for equal gradient contribution
+            repeat = max(1, round(len(empty_seqs) / max(len(visible_seqs), 1)))
             self.sequences = empty_seqs + visible_seqs * repeat
             print(f"  TrackNet dataset: {len(visible_seqs)} visible, "
-                  f"{len(empty_seqs)} empty → oversampled {repeat}x "
-                  f"→ {len(self.sequences)} total sequences")
+                  f"{len(empty_seqs)} empty -> oversampled {repeat}x "
+                  f"-> {len(self.sequences)} total sequences")
         else:
             self.sequences = visible_seqs + empty_seqs
             if visible_seqs:
                 print(f"  TrackNet dataset: {len(visible_seqs)} visible, "
-                      f"{len(empty_seqs)} empty → {len(self.sequences)} total")
+                      f"{len(empty_seqs)} empty ->{len(self.sequences)} total")
 
     def __len__(self):
         return len(self.sequences)
 
     def _load_frame(self, path: str) -> tuple:
-        """Load a frame → ((3, H, W) float32 [0,1], orig_w, orig_h).
+        """Load a frame ->((3, H, W) float32 [0,1], orig_w, orig_h).
 
         Checks for a pre-resized cache first (saved by --preprocess).
         Cache is already 640×360 so no resize needed — ~3-4x faster loading.
@@ -450,7 +463,7 @@ class TrackNetDataset(Dataset):
         f1, _, _       = self._load_frame(path1)
         f2, orig_w, orig_h = self._load_frame(path2)
 
-        # Scale label coords from original frame resolution → model resolution
+        # Scale label coords from original frame resolution ->model resolution
         if vis2 > 0 and x2 >= 0 and y2 >= 0:
             cx = x2 * INPUT_W / orig_w
             cy = y2 * INPUT_H / orig_h
@@ -474,10 +487,11 @@ class TrackNetDataset(Dataset):
             f2 = np.clip(f2 * b, 0.0, 1.0)
 
             # Independent Gaussian noise per frame (std=0.02)
-            # Different noise per frame so diff channels learn noise robustness
-            f0 = np.clip(f0 + np.random.normal(0, 0.02, f0.shape).astype(np.float32), 0.0, 1.0)
-            f1 = np.clip(f1 + np.random.normal(0, 0.02, f1.shape).astype(np.float32), 0.0, 1.0)
-            f2 = np.clip(f2 + np.random.normal(0, 0.02, f2.shape).astype(np.float32), 0.0, 1.0)
+            # Single allocation for all 3 frames — ~3x faster than separate calls
+            noise = np.random.normal(0, 0.02, (3, *f0.shape)).astype(np.float32)
+            f0 = np.clip(f0 + noise[0], 0.0, 1.0)
+            f1 = np.clip(f1 + noise[1], 0.0, 1.0)
+            f2 = np.clip(f2 + noise[2], 0.0, 1.0)
 
             # Motion blur (30% chance) — simulates fast ball during shots/passes
             if pyrandom.random() < 0.3:
@@ -493,7 +507,7 @@ class TrackNetDataset(Dataset):
 
         # Motion diff maps (V4): |frame_{t-1} - frame_{t-2}| and |frame_t - frame_{t-1}|
         # Computed AFTER augmentation so they reflect the augmented frames.
-        # Averaged over RGB channels → (1, H, W) motion magnitude in [0, 1].
+        # Averaged over RGB channels ->(1, H, W) motion magnitude in [0, 1].
         diff01 = np.abs(f1 - f0).mean(axis=0, keepdims=True)  # (1, H, W)
         diff12 = np.abs(f2 - f1).mean(axis=0, keepdims=True)  # (1, H, W)
         inp = np.concatenate([f0, f1, f2, diff01, diff12], axis=0)   # (11, H, W)
@@ -517,14 +531,17 @@ class TrackNetDataset(Dataset):
 def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                    device: str = "cuda:0",
                    output_dir: str = "runs/tracknet/weights",
-                   num_workers: int = 0,
+                   num_workers: int = 4,
                    resume: bool = False,
-                   accum_steps: int = 2):
+                   accum_steps: int = 2,
+                   data_root: str | None = None):
     """Train TrackNetV3 on basketball frame sequences.
 
     Args:
         accum_steps: gradient accumulation steps. Effective batch size is
                      batch_size * accum_steps (default 8*2=16).
+        data_root: root directory for frame data. When set, CSV paths like
+                   'data\\...' are remapped to data_root/... for fast local I/O.
     """
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -533,8 +550,9 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
     val_csv   = str(Path(data_dir) / "val.csv")
 
     print("Building training dataset ...")
-    train_ds = TrackNetDataset(train_csv, oversample_visible=True, augment=True)
-    val_ds   = (TrackNetDataset(val_csv, augment=False)
+    train_ds = TrackNetDataset(train_csv, oversample_visible=True, augment=True,
+                               data_root=data_root)
+    val_ds   = (TrackNetDataset(val_csv, augment=False, data_root=data_root)
                 if Path(val_csv).exists() else None)
 
     _pw = num_workers > 0
@@ -600,7 +618,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
         print("  No checkpoint found — starting from scratch")
 
     eff_batch = batch_size * accum_steps
-    print(f"  batch={batch_size} x accum={accum_steps} → effective batch {eff_batch}")
+    print(f"  batch={batch_size} x accum={accum_steps} ->effective batch {eff_batch}")
     print(f"  AMP fp16: {'enabled' if use_amp else 'disabled'}")
 
     for epoch in range(start_epoch, epochs):
@@ -822,7 +840,7 @@ def preprocess_frames(data_dir: str) -> None:
             for row in csv.DictReader(f):
                 paths.add(row["frame_path"])
 
-    print(f"Pre-processing {len(paths)} frames → .npy cache ...")
+    print(f"Pre-processing {len(paths)} frames ->.npy cache ...")
     print(f"  Estimated disk: {len(paths) * 691 / 1024:.0f} MB")
     done = skipped = 0
     for i, path in enumerate(sorted(paths)):
@@ -851,16 +869,19 @@ if __name__ == "__main__":
                         help="Train TrackNet on basketball data")
     parser.add_argument("--preprocess", action="store_true",
                         help="Pre-resize all frames to 640x360 for faster training")
-    parser.add_argument("--data", default="data/tracknet_labels/",
+    parser.add_argument("--data", default="data/tracknet_merged/",
                         help="Directory containing train.csv / val.csv")
+    parser.add_argument("--data-root",
+                        default=r"C:\Users\wanns\Desktop\Personal Project Data",
+                        help="Root directory for frame data (remaps CSV 'data\\' paths)")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=8,
                         help="Batch size per step (default 8, effective 16 with accum=2)")
     parser.add_argument("--accum", type=int, default=2,
                         help="Gradient accumulation steps (effective batch = batch * accum)")
     parser.add_argument("--device", default="cuda:0")
-    parser.add_argument("--workers", type=int, default=0,
-                        help="DataLoader num_workers (default 0 for Windows)")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="DataLoader num_workers (default 4)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from last_ckpt.pt checkpoint")
     args = parser.parse_args()
@@ -871,6 +892,7 @@ if __name__ == "__main__":
         train_tracknet(args.data, epochs=args.epochs, batch_size=args.batch,
                        device=args.device,
                        num_workers=args.workers, resume=args.resume,
-                       accum_steps=args.accum)
+                       accum_steps=args.accum,
+                       data_root=args.data_root)
     else:
         print("Use --train or --preprocess. See --help for options.")
