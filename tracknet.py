@@ -145,6 +145,12 @@ class TrackNetV3(nn.Module):
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+        # Output layer produces raw logits — near-zero init keeps initial
+        # predictions close to sigmoid(0)=0.5 instead of the extreme values
+        # (0.01 or 0.99) that Kaiming init produces, avoiding massive initial
+        # loss from the (pred^2 * log(1-pred)) term on background pixels.
+        nn.init.normal_(self.conv18.weight, mean=0, std=0.001)
+        nn.init.constant_(self.conv18.bias, -2.0)  # sigmoid(-2)=0.12, conservative no-ball prior
 
 
 # ---------------------------------------------------------------------------
@@ -172,7 +178,7 @@ def postprocess_heatmap(heatmap: np.ndarray,
     """
     if heatmap.ndim == 3:
         heatmap = heatmap[0]
-    heatmap = heatmap.reshape(INPUT_H, INPUT_W)
+    heatmap = heatmap.reshape(INPUT_H, INPUT_W).astype(np.float32)
 
     # Slight blur to suppress single-pixel noise before finding peak
     heatmap = cv2.GaussianBlur(heatmap, (5, 5), 1.0)
@@ -245,17 +251,19 @@ def generate_heatmap(cx: int, cy: int, w: int = INPUT_W, h: int = INPUT_H,
 # ---------------------------------------------------------------------------
 
 def focal_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """CenterNet focal loss for heatmap regression.
+    """CenterNet focal loss (Zhou et al. 2019, Objects as Points).
 
-    For ball pixels (GT > 0): penalises by (1-pred)^2 so confident correct
-    predictions are down-weighted.
-    For background pixels: penalises by (1-GT)^4 * pred^2 so near-GT pixels
-    (which are almost-ball by the Gaussian spread) are treated leniently.
-    Normalised by number of positive pixels to remain scale-stable.
+    Positive = only the peak pixel(s) where target == 1. The Gaussian decay
+    around the peak is handled by the negative term's (1-Y)^4 weighting,
+    which gracefully reduces the penalty near the center.
+
+    Each term is averaged over its own pixel count so that the ~4 positive
+    pixels aren't drowned out by ~1.8M negative pixels.
     """
     pred = torch.sigmoid(pred_logits)
-    pos_mask = (target >= 0.01).float()
-    neg_mask = 1.0 - pos_mask
+    # Paper: positive = only the peak (Y == 1), not the full Gaussian blob.
+    pos_mask = (target >= 0.9999).float()
+    neg_mask = (target < 0.9999).float()
 
     pos_loss = -(torch.pow(1.0 - pred, 2.0)
                  * torch.log(pred.clamp(min=1e-6))) * pos_mask
@@ -263,12 +271,9 @@ def focal_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
                  * torch.pow(pred, 2.0)
                  * torch.log((1.0 - pred).clamp(min=1e-6))) * neg_mask
 
-    # Standard CenterNet normalization: both terms divided by num_pos.
-    # The (1-GT)^4 * pred^2 focal weighting already suppresses easy negatives —
-    # dividing neg by num_total on top of that made background penalty ~1700x
-    # weaker per-pixel, so the model could never learn to suppress false positives.
     num_pos = pos_mask.sum().clamp(min=1)
-    return (pos_loss.sum() + neg_loss.sum()) / num_pos
+    num_neg = neg_mask.sum().clamp(min=1)
+    return pos_loss.sum() / num_pos + neg_loss.sum() / num_neg
 
 
 # ---------------------------------------------------------------------------

@@ -84,7 +84,7 @@ def parse_frame_number(path: str) -> int:
 
 @torch.inference_mode()
 def find_disagreements(data_dir: str, weights: str, visualize: bool = False,
-                       max_vis: int = 200):
+                       max_vis: int = 200, data_root: str | None = None):
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
     print(f"Loading model from {weights} ...")
@@ -104,8 +104,13 @@ def find_disagreements(data_dir: str, weights: str, visualize: bool = False,
         entries = []
         with open(csv_path) as f:
             for row in csv.DictReader(f):
+                fp = row["frame_path"]
+                if data_root is not None:
+                    fp = fp.replace("\\", "/")
+                    if fp.startswith("data/"):
+                        fp = str(Path(data_root) / fp[len("data/"):])
                 entries.append((
-                    row["frame_path"],
+                    fp,
                     int(row["visibility"]),
                     float(row["x"]) if row["visibility"] != "0" else -1.0,
                     float(row["y"]) if row["visibility"] != "0" else -1.0,
@@ -254,10 +259,13 @@ def find_disagreements(data_dir: str, weights: str, visualize: bool = False,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Find disagreements between TrackNet and labels")
-    parser.add_argument("--data", required=True,
+    parser.add_argument("--data", default="data/tracknet_merged",
                         help="Directory with train.csv / val.csv")
     parser.add_argument("--weights", default="runs/tracknet/weights/best.pt",
                         help="Trained TrackNet weights")
+    parser.add_argument("--data-root",
+                        default=r"C:\Users\wanns\Desktop\Personal Project Data",
+                        help="Root directory for frame data (remaps CSV 'data\\' paths)")
     parser.add_argument("--visualize", action="store_true",
                         help="Save annotated images of disagreements")
     parser.add_argument("--max-vis", type=int, default=200,
@@ -265,4 +273,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     find_disagreements(args.data, args.weights,
-                       visualize=args.visualize, max_vis=args.max_vis)
+                       visualize=args.visualize, max_vis=args.max_vis,
+                       data_root=args.data_root)
