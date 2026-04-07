@@ -8,6 +8,8 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
 - Jackson Kennedy
 - Nathan Wan
 - Nathan Todd
+- Hudson Noyes
+- James Sweat
 
 ---
 
@@ -59,7 +61,7 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
    │  Jersey OCR         │  │  BallInterpolator    │  │   Every processed      │
    │  Team classify      │  │  (gap filling)       │  │   frame, cached        │
    │  Velocity tracker   │  │                      │  │                        │
-   └──────┬──────────────┘  └─────────┬────────────┘  └─────────────┬──────────┘
+   └──────┬──────────────┘  └──────────┬───────────┘  └───────────────┬────────┘
           │                            │                              │
           └────────────────────────────┼──────────────────────────────┘
                                        │
