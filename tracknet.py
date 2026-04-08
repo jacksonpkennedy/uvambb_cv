@@ -16,9 +16,11 @@ import argparse
 import csv
 import gc
 import math
+import os
 import random as pyrandom
 
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -26,6 +28,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+
+try:
+    import wandb
+    _HAS_WANDB = True
+except ImportError:
+    _HAS_WANDB = False
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +341,30 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
             "f1": f1, "tp": tp, "fp": fp, "fn": fn}
 
 
+def _wandb_prediction_samples(model, val_loader, device, n_samples=8):
+    """Generate W&B image table with GT vs predicted heatmap overlays."""
+    model.eval()
+    images = []
+    inp, target, _vis = next(iter(val_loader))
+    inp = inp.to(device)
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=(device != "cpu")):
+        pred = torch.sigmoid(model(inp)).cpu().numpy()
+    target_np = target.numpy()
+    for b in range(min(n_samples, inp.shape[0])):
+        frame = (inp[b, 6:9].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
+        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        gt_hmap = (target_np[b, 0] * 255).astype(np.uint8)
+        pr_hmap = (pred[b, 0] * 255).astype(np.uint8)
+        gt_color = cv2.applyColorMap(gt_hmap, cv2.COLORMAP_JET)
+        pr_color = cv2.applyColorMap(pr_hmap, cv2.COLORMAP_JET)
+        gt_overlay = cv2.addWeighted(frame, 0.6, gt_color, 0.4, 0)
+        pr_overlay = cv2.addWeighted(frame, 0.6, pr_color, 0.4, 0)
+        combined = np.hstack([gt_overlay, pr_overlay])
+        combined = cv2.cvtColor(combined, cv2.COLOR_BGR2RGB)
+        images.append(wandb.Image(combined, caption=f"sample_{b} GT|Pred"))
+    return images
+
+
 # ---------------------------------------------------------------------------
 # Dataset — sequences of 3 consecutive frames with ball center labels
 # ---------------------------------------------------------------------------
@@ -621,6 +653,36 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
     print(f"  batch={batch_size} x accum={accum_steps} ->effective batch {eff_batch}")
     print(f"  AMP fp16: {'enabled' if use_amp else 'disabled'}")
 
+    # --- W&B init ---
+    wandb_run_id = None
+    if _HAS_WANDB:
+        if resume and ckpt_path.exists():
+            wandb_run_id = ckpt.get("wandb_run_id")
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "uvambb-cv"),
+            entity=os.environ.get("WANDB_ENTITY"),
+            id=wandb_run_id,
+            resume="allow" if wandb_run_id else None,
+            name=f"tracknet-{datetime.now().strftime('%Y%m%d-%H%M')}",
+            config={
+                "model": "TrackNetV3",
+                "epochs": epochs,
+                "batch_size": batch_size,
+                "accum_steps": accum_steps,
+                "effective_batch": eff_batch,
+                "lr": 1e-4,
+                "weight_decay": 1e-4,
+                "scheduler": "CosineAnnealingLR",
+                "optimizer": "AdamW",
+                "amp": use_amp,
+                "early_stop_patience": early_stop_pat,
+                "data_dir": data_dir,
+                "train_samples": len(train_ds),
+                "val_samples": len(val_ds) if val_ds else 0,
+            },
+        )
+        wandb_run_id = wandb.run.id
+
     for epoch in range(start_epoch, epochs):
         # --- Train ---
         model.train()
@@ -663,16 +725,45 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                   f"prec={pe['precision']:.3f}  rec={pe['recall']:.3f}  "
                   f"F1={pe['f1']:.3f}  "
                   f"(TP={pe['tp']} FP={pe['fp']} FN={pe['fn']})")
+            if _HAS_WANDB:
+                log_dict = {
+                    "epoch": epoch + 1,
+                    "train_loss": avg_train,
+                    "val_loss": pe["val_loss"],
+                    "precision": pe["precision"],
+                    "recall": pe["recall"],
+                    "f1": pe["f1"],
+                    "tp": pe["tp"],
+                    "fp": pe["fp"],
+                    "fn": pe["fn"],
+                    "lr": scheduler.get_last_lr()[0],
+                }
+                if (epoch + 1) % 5 == 0:
+                    log_dict["predictions"] = _wandb_prediction_samples(
+                        model, val_loader, device)
+                wandb.log(log_dict)
+
             if pe["f1"] > best_f1:
                 best_f1    = pe["f1"]
                 no_improve = 0
                 torch.save(model.state_dict(), str(out_path / "best.pt"))
                 print(f"  -> Saved best model (F1={best_f1:.3f})")
+                if _HAS_WANDB:
+                    art = wandb.Artifact(
+                        "tracknet-best", type="model",
+                        description=f"TrackNet best.pt F1={best_f1:.3f} epoch={epoch+1}",
+                        metadata={"f1": best_f1, "epoch": epoch + 1},
+                    )
+                    art.add_file(str(out_path / "best.pt"))
+                    wandb.log_artifact(art)
             else:
                 no_improve += 1
                 print(f"  No F1 improvement ({no_improve}/{early_stop_pat})")
         else:
             print(f"Epoch {epoch+1}/{epochs}  train_loss={avg_train:.4f}")
+            if _HAS_WANDB:
+                wandb.log({"epoch": epoch + 1, "train_loss": avg_train,
+                           "lr": scheduler.get_last_lr()[0]})
 
         scheduler.step()
 
@@ -685,6 +776,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
             "scaler":     scaler.state_dict(),
             "best_f1":    best_f1,
             "no_improve": no_improve,
+            "wandb_run_id": wandb_run_id,
         }, str(out_path / "last_ckpt.pt"))
 
         gc.collect()
@@ -696,6 +788,8 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
             break
 
     print(f"\nTraining complete. Best model: {out_path / 'best.pt'}")
+    if _HAS_WANDB:
+        wandb.finish()
     return str(out_path / "best.pt")
 
 
@@ -864,6 +958,10 @@ def preprocess_frames(data_dir: str) -> None:
 
 
 if __name__ == "__main__":
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+
     parser = argparse.ArgumentParser(description="TrackNet ball tracker")
     parser.add_argument("--train", action="store_true",
                         help="Train TrackNet on basketball data")
@@ -872,8 +970,8 @@ if __name__ == "__main__":
     parser.add_argument("--data", default="data/tracknet_merged/",
                         help="Directory containing train.csv / val.csv")
     parser.add_argument("--data-root",
-                        default=r"C:\Users\wanns\Desktop\Personal Project Data",
-                        help="Root directory for frame data (remaps CSV 'data\\' paths)")
+                        default=os.environ.get("UVAMBB_DATA_ROOT"),
+                        help="Root directory for frame data (or set UVAMBB_DATA_ROOT in .env)")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch", type=int, default=8,
                         help="Batch size per step (default 8, effective 16 with accum=2)")
