@@ -12,11 +12,27 @@ Usage:
 import argparse
 import csv
 import math
+import os
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
+
+try:
+    import wandb
+    _HAS_WANDB = True
+except ImportError:
+    _HAS_WANDB = False
+
+
+def _count_csv(path: str) -> int:
+    """Count data rows in a CSV (excluding header). Returns 0 if file missing."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    with open(p) as f:
+        return max(sum(1 for _ in f) - 1, 0)
 
 from tracknet import (
     TrackNetV3, INPUT_W, INPUT_H, postprocess_heatmap,
@@ -249,6 +265,32 @@ def find_disagreements(data_dir: str, weights: str, visualize: bool = False,
     if visualize:
         print(f"\nSaved visualizations to {out_dir}/")
     print(f"Saved disagreement CSVs to output/disagreements/")
+
+    # Log audit results to W&B for tracking label quality over iterations
+    if _HAS_WANDB:
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "uvambb-cv"),
+            entity=os.environ.get("WANDB_ENTITY"),
+            job_type="label-audit",
+            name=f"audit-{Path(weights).stem}",
+        )
+        wandb.log({
+            "audit/false_negatives": sum(
+                _count_csv(f"output/disagreements/{s}_false_negatives.csv")
+                for s in ("train", "val")),
+            "audit/false_positives": sum(
+                _count_csv(f"output/disagreements/{s}_false_positives.csv")
+                for s in ("train", "val")),
+            "audit/position_mismatches": sum(
+                _count_csv(f"output/disagreements/{s}_position_mismatch.csv")
+                for s in ("train", "val")),
+        })
+        art = wandb.Artifact("disagreements", type="label-audit")
+        for csv_file in Path("output/disagreements").glob("*.csv"):
+            art.add_file(str(csv_file))
+        wandb.log_artifact(art)
+        wandb.finish()
+
     print("\nNext steps:")
     print("  1. Review the visualized disagreements")
     print("  2. Decide which labels to fix (false_positives are usually bad labels)")
@@ -257,6 +299,10 @@ def find_disagreements(data_dir: str, weights: str, visualize: bool = False,
 
 
 if __name__ == "__main__":
+    import os
+    from dotenv import load_dotenv
+    load_dotenv()
+
     parser = argparse.ArgumentParser(
         description="Find disagreements between TrackNet and labels")
     parser.add_argument("--data", default="data/tracknet_merged",
@@ -264,11 +310,11 @@ if __name__ == "__main__":
     parser.add_argument("--weights", default="runs/tracknet/weights/best.pt",
                         help="Trained TrackNet weights")
     parser.add_argument("--data-root",
-                        default=r"C:\Users\wanns\Desktop\Personal Project Data",
-                        help="Root directory for frame data (remaps CSV 'data\\' paths)")
+                        default=os.environ.get("UVAMBB_DATA_ROOT"),
+                        help="Root directory for frame data (or set UVAMBB_DATA_ROOT in .env)")
     parser.add_argument("--visualize", action="store_true",
                         help="Save annotated images of disagreements")
-    parser.add_argument("--max-vis", type=int, default=200,
+    parser.add_argument("--max-vis", type=int, default=500,
                         help="Max visualizations per category")
     args = parser.parse_args()
 

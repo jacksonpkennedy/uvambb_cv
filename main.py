@@ -70,7 +70,7 @@ VEL_EXIT_THRESH    = 80
 
 # TrackNet — heatmap-based ball detection using 3 consecutive frames
 TRACKNET_WEIGHTS     = "runs/tracknet/weights/best.pt"  # path to trained TrackNet weights
-TRACKNET_CONF_THRESH = 0.3                        # heatmap peak confidence threshold (lower for early training)
+TRACKNET_CONF_THRESH = 0.5                        # heatmap peak confidence threshold (lower for early training)
 TRACKNET_BALL_RADIUS = 15                          # pixels, for bbox synthesis from center point
 
 # Jersey OCR
@@ -81,13 +81,16 @@ OCR_CONFIRM_COUNT  = 2      # need this many consistent reads to lock a jersey n
 BALL_COURT_X_PAD     = 0.05    # horizontal slack beyond court edges (fraction of frame_w)
 BALL_MAX_BBOX_AREA   = 2500    # max ball bbox area in pixels (at 1080p) — rejects bald heads
 BALL_MIN_BBOX_AREA   = 50      # min ball bbox area — rejects noise
-BALL_MAX_TELEPORT_PX = 450     # max pixels ball can move per frame (at 1080p, 60fps)
+BALL_MAX_TELEPORT_PX = 250     # max pixels ball can move per frame (at 1080p, 60fps)
 BALL_TELEPORT_GRACE  = 10      # frames since last sighting before teleport check resets
 
 # Ball interpolation — fill gaps in detection using confirmed neighbors
 BALL_INTERP_BUFFER   = 20      # frames to buffer for look-ahead (~333ms at 60fps)
 BALL_INTERP_MAX_GAP  = 8       # max consecutive missing frames to interpolate
 
+# Court visibility detection
+COURT_MIN_LINES      = 4       # min Hough lines to consider court visible
+COURT_WOOD_RATIO     = 0.15    # min ratio of wood-colored pixels (tan/brown floor)
 
 _G = (0, 255, 0)
 SKELETON_EDGES = [
@@ -900,6 +903,38 @@ class BallValidator:
 # Court ROI — polygon check
 # ---------------------------------------------------------------------------
 
+def is_court_visible(frame: np.ndarray) -> bool:
+    """Detect whether the basketball court is visible in this frame.
+
+    Uses two checks:
+      1. Wood floor detection — court floors are tan/brown wood with a
+         distinctive HSV range unlike skin, jerseys, or crowd colors
+      2. Hough line detection — courts have many straight painted lines
+         (any color) visible as edges against the wood
+    Both must pass to return True.
+    """
+    h, w = frame.shape[:2]
+    # Downsample for speed
+    small = cv2.resize(frame, (w // 2, h // 2))
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+    # --- Check 1: Wood floor color ratio (HSV) ---
+    # Basketball court wood is tan/light brown: low-mid saturation, high value
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    wood_mask = cv2.inRange(hsv, (10, 30, 120), (30, 180, 240))
+    wood_ratio = wood_mask.sum() / 255.0 / (wood_mask.shape[0] * wood_mask.shape[1])
+    if wood_ratio < COURT_WOOD_RATIO:
+        return False
+
+    # --- Check 2: Hough line detection ---
+    # Court lines (any color) create strong edges against the wood floor
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
+                            threshold=80, minLineLength=40, maxLineGap=10)
+    num_lines = 0 if lines is None else len(lines)
+    return num_lines >= COURT_MIN_LINES
+
+
 def build_court_roi(frame_w: int, frame_h: int) -> np.ndarray:
     pts = np.array([
         [frame_w * 0.13, frame_h * 0.88],
@@ -1147,6 +1182,10 @@ def finetune(epochs: int = 50, batch: int = 8, imgsz: int = 960):
     print(f"Fine-tuning YOLO11s  |  epochs={epochs}  batch={batch}  "
           f"imgsz={imgsz}  nbs=64 (grad accum)  device={device}")
 
+    # Enable W&B for ultralytics (auto-detected if wandb is installed)
+    import os
+    os.environ.setdefault("WANDB_PROJECT", os.environ.get("WANDB_PROJECT", "uvambb-cv"))
+
     model = YOLO("yolo11s.pt")
     model.train(
         data=data_yaml,
@@ -1346,7 +1385,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
             tracknet_ball_box = None
             if tracknet_model is not None:
                 tn_det = tracknet_model.predict(frame)
-                if tn_det is not None:
+                if is_court_visible(frame) and tn_det is not None:
                     tracknet_ball_box = tn_det["box"]
 
             # Redraw all non-ball annotations from the last processed frame
@@ -1419,12 +1458,16 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                     if conf_val >= 0.30:
                         ref_dets.append({"tid": tid, "box": box_list, "cls": CLS_REF})
 
-        # ---- 1a. TrackNet primary ball detection --------------------------------
+        # ---- 1a. Court visibility check ----------------------------------------
+        court_visible = is_court_visible(frame)
+
+        # ---- 1b. TrackNet primary ball detection --------------------------------
         # TrackNet uses 3 consecutive frames (temporal context) for heatmap
         # regression — much better at small, fast-moving balls than YOLO.
+        # Skip ball detection when court is not visible (closeups/replays).
         if tracknet_model is not None:
             tn_det = tracknet_model.predict(frame)
-            if tn_det is not None:
+            if court_visible and tn_det is not None:
                 ball_dets.append(tn_det)
                 ball_source = "TrackNet"
 

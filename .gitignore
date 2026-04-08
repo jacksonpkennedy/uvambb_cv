@@ -6,3 +6,5 @@ test.mp4
 *.ts
 *.pt
 /runs
+.env
+wandb/

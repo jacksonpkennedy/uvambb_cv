@@ -20,8 +20,15 @@ Usage:
 """
 import argparse
 import csv
+import os
 import shutil
 from pathlib import Path
+
+try:
+    import wandb
+    _HAS_WANDB = True
+except ImportError:
+    _HAS_WANDB = False
 
 
 def load_false_positives(disagree_dir: Path, split: str) -> set:
@@ -142,6 +149,10 @@ def main():
         print(f"Error: {disagree_dir} not found. Run find_disagreements.py first.")
         return
 
+    total_removed = 0
+    total_repositioned = 0
+    total_added = 0
+
     for split in ("train", "val"):
         csv_path = Path(args.data) / f"{split}.csv"
         if not csv_path.exists():
@@ -170,6 +181,10 @@ def main():
                           args.fix_positions, args.add_missed,
                           args.min_dist, args.min_conf)
 
+        total_removed += stats["removed"]
+        total_repositioned += stats["repositioned"]
+        total_added += stats["added"]
+
         print(f"  -> Removed {stats['removed']} bad labels")
         if args.fix_positions:
             print(f"  -> Repositioned {stats['repositioned']} labels")
@@ -177,9 +192,33 @@ def main():
             print(f"  -> Added {stats['added']} missed labels")
         print(f"  -> Total rows: {stats['total']}")
 
+    # Log fix stats to W&B for tracking label quality over iterations
+    if _HAS_WANDB:
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "uvambb-cv"),
+            entity=os.environ.get("WANDB_ENTITY"),
+            job_type="label-fix",
+            name="apply-fixes",
+        )
+        wandb.log({
+            "fixes/removed": total_removed,
+            "fixes/repositioned": total_repositioned,
+            "fixes/added": total_added,
+        })
+        # Upload cleaned CSVs as versioned dataset artifact
+        art = wandb.Artifact("tracknet-labels", type="dataset")
+        for split in ("train", "val"):
+            p = Path(args.data) / f"{split}.csv"
+            if p.exists():
+                art.add_file(str(p))
+        wandb.log_artifact(art)
+        wandb.finish()
+
     print("\nDone! Next: retrain with cleaned labels:")
     print("  python tracknet.py --train --epochs 100 --batch 8")
 
 
 if __name__ == "__main__":
+    from dotenv import load_dotenv
+    load_dotenv()
     main()
