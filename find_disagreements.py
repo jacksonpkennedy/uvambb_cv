@@ -321,3 +321,24 @@ if __name__ == "__main__":
     find_disagreements(args.data, args.weights,
                        visualize=args.visualize, max_vis=args.max_vis,
                        data_root=args.data_root)
+    
+'''
+next steps:
+# Game 01: already used frames 0-5000, grab next 10k
+python auto_label_tracknet.py --video data/game_01.mp4 --output-dir data/tracknet_autolabels_01b --start-frame 5000 --max-frames 10000
+
+# Game 02: already used frames 0-13000, grab next 10k
+python auto_label_tracknet.py --video data/game_02.mp4 --output-dir data/tracknet_autolabels_02b --start-frame 13000 --max-frames 10000
+
+# Game 03: already used frames 0-10000, grab next 10k
+python auto_label_tracknet.py --video data/game_03.mp4 --output-dir data/tracknet_autolabels_03b --start-frame 10000 --max-frames 10000
+After all three finish, merge everything:
+
+
+python merge_labels.py
+Then preprocess + retrain:
+
+
+python tracknet.py --preprocess --data data/tracknet_merged
+python tracknet.py --train --epochs 100 --batch 8
+'''
