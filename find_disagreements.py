@@ -314,7 +314,7 @@ if __name__ == "__main__":
                         help="Root directory for frame data (or set UVAMBB_DATA_ROOT in .env)")
     parser.add_argument("--visualize", action="store_true",
                         help="Save annotated images of disagreements")
-    parser.add_argument("--max-vis", type=int, default=500,
+    parser.add_argument("--max-vis", type=int, default=1000,
                         help="Max visualizations per category")
     args = parser.parse_args()
 

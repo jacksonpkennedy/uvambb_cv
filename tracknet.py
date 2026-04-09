@@ -739,8 +739,11 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                     "lr": scheduler.get_last_lr()[0],
                 }
                 if (epoch + 1) % 5 == 0:
-                    log_dict["predictions"] = _wandb_prediction_samples(
-                        model, val_loader, device)
+                    try:
+                        log_dict["predictions"] = _wandb_prediction_samples(
+                            model, val_loader, device)
+                    except Exception as e:
+                        print(f"  W&B prediction viz skipped: {e}")
                 wandb.log(log_dict)
 
             if pe["f1"] > best_f1:
