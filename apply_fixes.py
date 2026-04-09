@@ -31,25 +31,30 @@ except ImportError:
     _HAS_WANDB = False
 
 
+def _stem(path: str) -> str:
+    """Extract frame stem from any path format (absolute or relative)."""
+    return Path(path).stem.replace("_640x360", "")
+
+
 def load_false_positives(disagree_dir: Path, split: str) -> set:
-    """Frame paths where label says ball but model doesn't see one."""
+    """Frame stems where label says ball but model doesn't see one."""
     fp_set = set()
     p = disagree_dir / f"{split}_false_positives.csv"
     if p.exists():
         with open(p) as f:
             for row in csv.DictReader(f):
-                fp_set.add(row["frame_path"])
+                fp_set.add(_stem(row["frame_path"]))
     return fp_set
 
 
 def load_position_mismatches(disagree_dir: Path, split: str) -> dict:
-    """Frame paths where both see ball but positions differ."""
+    """Frame stems where both see ball but positions differ."""
     fixes = {}
     p = disagree_dir / f"{split}_position_mismatch.csv"
     if p.exists():
         with open(p) as f:
             for row in csv.DictReader(f):
-                fixes[row["frame_path"]] = {
+                fixes[_stem(row["frame_path"])] = {
                     "pred_x": float(row["pred_x"]),
                     "pred_y": float(row["pred_y"]),
                     "dist": float(row["distance_px"]),
@@ -58,13 +63,13 @@ def load_position_mismatches(disagree_dir: Path, split: str) -> dict:
 
 
 def load_false_negatives(disagree_dir: Path, split: str) -> dict:
-    """Frame paths where model sees ball but label says none."""
+    """Frame stems where model sees ball but label says none."""
     missed = {}
     p = disagree_dir / f"{split}_false_negatives.csv"
     if p.exists():
         with open(p) as f:
             for row in csv.DictReader(f):
-                missed[row["frame_path"]] = {
+                missed[_stem(row["frame_path"])] = {
                     "pred_x": float(row["pred_x"]),
                     "pred_y": float(row["pred_y"]),
                     "pred_conf": float(row["pred_conf"]),
@@ -86,10 +91,10 @@ def patch_csv(csv_path: str, fp_set: set, pos_fixes: dict, missed: dict,
     added = 0
 
     for row in rows:
-        fp = row["frame_path"]
+        stem = _stem(row["frame_path"])
 
         # 1) Remove false positives (bad labels)
-        if fp in fp_set and int(row["visibility"]) > 0:
+        if stem in fp_set and int(row["visibility"]) > 0:
             row["visibility"] = "0"
             row["x"] = "-1"
             row["y"] = "-1"
@@ -97,8 +102,8 @@ def patch_csv(csv_path: str, fp_set: set, pos_fixes: dict, missed: dict,
             continue
 
         # 2) Fix position mismatches (use model's prediction)
-        if fix_positions and fp in pos_fixes:
-            fix = pos_fixes[fp]
+        if fix_positions and stem in pos_fixes:
+            fix = pos_fixes[stem]
             if fix["dist"] >= min_dist and int(row["visibility"]) > 0:
                 row["x"] = f"{fix['pred_x']:.1f}"
                 row["y"] = f"{fix['pred_y']:.1f}"
@@ -106,8 +111,8 @@ def patch_csv(csv_path: str, fp_set: set, pos_fixes: dict, missed: dict,
                 continue
 
         # 3) Recover false negatives (add missed labels)
-        if add_missed and fp in missed:
-            m = missed[fp]
+        if add_missed and stem in missed:
+            m = missed[stem]
             if int(row["visibility"]) == 0 and m["pred_conf"] >= min_conf:
                 row["visibility"] = "1"
                 row["x"] = f"{m['pred_x']:.1f}"

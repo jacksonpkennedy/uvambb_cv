@@ -341,4 +341,22 @@ Then preprocess + retrain:
 
 python tracknet.py --preprocess --data data/tracknet_merged
 python tracknet.py --train --epochs 100 --batch 8
+
+
+iteration review:
+False negatives (no label, model sees ball):
+
+Delete images where model hallucinated → those stay as "no ball" (correct)
+Keep images where model found a real ball → --add-missed adds the label
+
+False positives (has label, model doesn't see ball):
+
+Keep images where the label is genuinely wrong → apply_fixes removes the bad label
+Delete images where the label is actually correct (model missed it) → those stay labeled
+
+how do i handle position mismatch because sometimes the red circle (label) is correct and sometimes the green circle (model) is correct
+
+Open output/disagreements/position_mismatch/
+For each image, if the red circle (label) is correct and model is wrong → delete the image
+If the green circle (model) is more accurate → keep the image
 '''
