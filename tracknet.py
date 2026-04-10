@@ -89,6 +89,7 @@ class TrackNetV3(nn.Module):
         self.conv8 = ConvBlock(256, 256)
         self.conv9 = ConvBlock(256, 256)
         self.conv10 = ConvBlock(256, 256)       # bottleneck (256ch, /8 res)
+        self.bottleneck_dropout = nn.Dropout2d(p=0.2)
 
         # --- Decoder (with skip connections) ---
         # After ups1: 256ch. cat with skip3(256ch) ->512ch
@@ -126,6 +127,7 @@ class TrackNetV3(nn.Module):
         x = self.conv8(x)
         x = self.conv9(x)
         x = self.conv10(x)
+        x = self.bottleneck_dropout(x)
 
         x = self.ups1(x)
         x = torch.cat([x, skip3], dim=1)        # 256+256=512
@@ -299,6 +301,7 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
     """
     tp = fp = fn = 0
     total_loss = 0.0
+    margins = []                      # peak - highest-distractor on visible frames
     model.eval()
     use_amp = device != "cpu"
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
@@ -320,8 +323,24 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
                 pred_hmap   = pred_np[b, 0]
                 pred_conf   = float(pred_hmap.max())
                 pred_detect = pred_conf >= conf_thresh
-                if pred_detect:
-                    pr_y, pr_x = divmod(int(pred_hmap.argmax()), INPUT_W)
+                pr_y, pr_x  = divmod(int(pred_hmap.argmax()), INPUT_W)
+
+                # Peak-to-distractor margin: on visible frames, mask a 21x21
+                # window around the primary peak and take the next-highest
+                # pixel as the "distractor". A large margin means the model
+                # confidently separates the ball from all background features;
+                # shrinking margin is a leading indicator of robustness decay
+                # that F1 alone can't see.
+                if has_ball:
+                    y0 = max(0, pr_y - 10)
+                    y1 = min(INPUT_H, pr_y + 11)
+                    x0 = max(0, pr_x - 10)
+                    x1 = min(INPUT_W, pr_x + 11)
+                    masked = pred_hmap.copy()
+                    masked[y0:y1, x0:x1] = 0.0
+                    distractor_conf = float(masked.max())
+                    margins.append(pred_conf - distractor_conf)
+
                 if pred_detect and has_ball:
                     dist = math.hypot(pr_x - gt_x, pr_y - gt_y)
                     if dist <= pe_thresh:
@@ -333,12 +352,14 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
                     fp += 1
                 elif has_ball:
                     fn += 1
-    avg_loss = total_loss / max(len(loader), 1)
+    avg_loss   = total_loss / max(len(loader), 1)
+    avg_margin = sum(margins) / max(len(margins), 1) if margins else 0.0
     prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
     return {"val_loss": avg_loss, "precision": prec, "recall": rec,
-            "f1": f1, "tp": tp, "fp": fp, "fn": fn}
+            "f1": f1, "margin": avg_margin,
+            "tp": tp, "fp": fp, "fn": fn}
 
 
 def _wandb_prediction_samples(model, val_loader, device, n_samples=8):
@@ -621,16 +642,16 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
     # AdamW: decoupled weight decay generalises better than L2 in Adam
     # (Loshchilov & Hutter 2019), especially with cosine schedulers.
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4,
-                                  weight_decay=1e-4)
+                                  weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=1e-6)
+        optimizer, T_max=40, eta_min=1e-6)
 
     use_amp = device != "cpu"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     best_f1        = 0.0
     no_improve     = 0       # epochs since best F1 improved
-    early_stop_pat = 15
+    early_stop_pat = 5
     start_epoch    = 0
 
     # Load best-ever F1 for overall tracking
@@ -733,21 +754,23 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
             pe = evaluate_pe(model, val_loader, device,
                              pe_thresh=5.0, conf_thresh=0.5)
             print(f"Epoch {epoch+1}/{epochs}  "
-                  f"train_loss={avg_train:.4f}  val_loss={pe['val_loss']:.4f}  "
+                  f"train_loss={avg_train:.4f}  "
+                  f"val_loss(diag)={pe['val_loss']:.4f}  "
                   f"prec={pe['precision']:.3f}  rec={pe['recall']:.3f}  "
-                  f"F1={pe['f1']:.3f}  "
+                  f"F1={pe['f1']:.3f}  margin={pe['margin']:.3f}  "
                   f"(TP={pe['tp']} FP={pe['fp']} FN={pe['fn']})")
             if _HAS_WANDB:
                 log_dict = {
                     "epoch": epoch + 1,
-                    "train_loss": avg_train,
-                    "val_loss": pe["val_loss"],
-                    "precision": pe["precision"],
-                    "recall": pe["recall"],
-                    "f1": pe["f1"],
-                    "tp": pe["tp"],
-                    "fp": pe["fp"],
-                    "fn": pe["fn"],
+                    "train/loss": avg_train,
+                    "val/loss_diagnostic": pe["val_loss"],
+                    "val/precision": pe["precision"],
+                    "val/recall": pe["recall"],
+                    "val/f1": pe["f1"],
+                    "val/margin": pe["margin"],
+                    "val/tp": pe["tp"],
+                    "val/fp": pe["fp"],
+                    "val/fn": pe["fn"],
                     "lr": scheduler.get_last_lr()[0],
                 }
                 if (epoch + 1) % 5 == 0:
@@ -784,7 +807,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
         else:
             print(f"Epoch {epoch+1}/{epochs}  train_loss={avg_train:.4f}")
             if _HAS_WANDB:
-                wandb.log({"epoch": epoch + 1, "train_loss": avg_train,
+                wandb.log({"epoch": epoch + 1, "train/loss": avg_train,
                            "lr": scheduler.get_last_lr()[0]})
 
         scheduler.step()

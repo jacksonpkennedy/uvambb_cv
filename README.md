@@ -122,6 +122,12 @@ uvambb_cv/
 ├── merge_labels.py                  # Merge per-game TrackNet labels with per-game 85/15 split
 ├── clean_labels.py                  # Re-verify auto-labels at higher YOLO confidence (removes bad labels)
 ├── verify_labels.py                 # Visual inspection — draws labeled positions on random sample of frames
+├── find_disagreements.py            # Audit trained model vs training labels (FN/FP/position mismatch)
+├── apply_fixes.py                   # Patch train/val CSVs from disagreement review results
+├── sync_disagreements.py            # Prune disagreement CSVs after manual image-folder review
+├── zero_neither_correct.py          # Zero labels for "neither correct" position mismatches
+├── csv_backup.py                    # Shared helper — timestamped train/val CSV snapshots
+├── fetch_weights.py                 # Download latest W&B artifact weights (TrackNet + YOLO)
 ├── bytetrack_players.yaml           # ByteTrack tracker config
 ├── requirements.txt                 # Python dependencies
 ├── data/
@@ -361,11 +367,132 @@ Post-game look-ahead analysis with 20-frame sliding buffer:
 
 TrackNet requires sequential frame labels (CSV with frame_path, visibility, x, y). The auto-labeling pipeline generates these from raw game video:
 
-1. **auto_label_tracknet.py** — runs YOLO (fine-tuned) + SAHI (COCO sports ball) on each frame with full BallValidator + BallTracker filtering. SAHI is used here (not in main inference) because it improves label recall for the training set.
+1. **auto_label_tracknet.py** — runs YOLO (fine-tuned) + SAHI (COCO sports ball) on each frame with full BallValidator + BallTracker filtering. SAHI is used here (not in main inference) because it improves label recall for the training set. Supports `--relabel` mode to re-run detection on already-extracted frames without re-decoding video.
 2. **merge_labels.py** — combines labels from multiple games into `data/tracknet_merged/`, using a per-game last-15% val split to ensure each split has representative data from all games.
 3. **clean_labels.py** — re-verifies every "visible" label by running YOLO at conf >= 0.50. If no ball is detected within 30px of the labeled position, the label is demoted to invisible. Addresses ~20% mislabel rate from low-confidence auto-labeling.
 4. **verify_labels.py** — draws green circles at labeled positions on a random sample of frames and saves annotated images for manual visual inspection.
 5. **convert_labels.py** — converts YOLO-seg polygon annotations (from Roboflow) to TrackNet CSV format, extracting centroids from polygon vertices. Deduplicates augmented frames.
+
+---
+
+## Iterative Training Cycle
+
+TrackNet label quality is the bottleneck — auto-labels from YOLO + SAHI are ~20% wrong, which caps achievable F1. Rather than hand-label tens of thousands of frames, we bootstrap quality by alternating between training and model-vs-label auditing. Each iteration the model gets stronger, which in turn exposes more label errors it could previously tolerate.
+
+### The loop
+
+```
+   ┌───────────────────────────────────────────────────────────────┐
+   │                                                                │
+   │   ┌──────────┐   ┌─────────┐   ┌──────────────────┐           │
+   │   │  Train   │──▶│  Audit  │──▶│   Human Review   │───┐       │
+   │   │ TrackNet │   │  (FN/FP │   │  (image folders) │   │       │
+   │   └──────────┘   │   /PM)  │   └──────────────────┘   │       │
+   │        ▲         └─────────┘                           │       │
+   │        │                                               ▼       │
+   │        │                                    ┌──────────────┐  │
+   │        └────────────────────────────────────│  Apply fixes │◀─┘
+   │                                             └──────────────┘
+   └───────────────────────────────────────────────────────────────┘
+```
+
+### Step 1 — Train
+
+```bash
+python tracknet.py --train --data data/tracknet_merged --epochs 100 --resume
+```
+
+Trains against the current best labels. The resulting `runs/tracknet/weights/best.pt` is logged to W&B as `tracknet-best:latest`.
+
+### Step 2 — Audit (find_disagreements.py)
+
+The trained model predicts on its own training data and compares against the CSV labels (from the previous iteration). Three disagreement categories are written to `output/disagreements/`:
+
+| Category | Meaning | What it reveals |
+|---|---|---|
+| **false_negatives** | Label = no ball, but model confidently predicts one | Labels the previous YOLO+SAHI pass missed — *recoverable* positives |
+| **false_positives** | Label = ball, but model heatmap is empty | Labels from bad YOLO detections (shoes, heads, referees) — *bad* labels |
+| **position_mismatch** | Both see a ball, but centers are >15px apart | One of the two is wrong (or both) — needs human decision |
+
+```bash
+python find_disagreements.py --data data/tracknet_merged \
+    --weights runs/tracknet/weights/best.pt --visualize
+```
+
+Visualizations land in `output/disagreements/{category}/{game}/{stem}.jpg` with red = label, green = model. Counts and the CSVs themselves are logged to W&B.
+
+### Step 3 — Human review (folder-based)
+
+The human keeps or deletes images in-place. For position_mismatches where *neither* dot is on the real ball, the image is moved into a `_neither/{game}/` subfolder.
+
+```
+output/disagreements/
+├── false_negatives/
+│   ├── game_01/     ← delete ones that aren't really the ball
+│   └── game_02/
+├── false_positives/
+│   └── ...          ← delete labels you want to keep (i.e., good labels)
+└── position_mismatch/
+    ├── game_01/     ← keep ones where model is right; delete rest
+    └── _neither/    ← neither label nor model is correct
+        ├── game_01/
+        └── game_02/
+```
+
+Deciding per image is fast (~1 second each) and leverages human vision for exactly the cases auto-labeling gets wrong.
+
+### Step 4 — Sync folders back to CSVs (sync_disagreements.py)
+
+```bash
+python sync_disagreements.py
+```
+
+After review, prunes the disagreement CSVs so they only contain rows whose image is still on disk. Backs up the originals to `output/disagreements/backups/<timestamp>/`.
+
+### Step 5 — Apply fixes
+
+Two scripts mutate `data/tracknet_merged/train.csv` and `val.csv`, both backing up via `csv_backup.py` to `data/tracknet_merged/backups/<timestamp>_<tag>/` before writing:
+
+**apply_fixes.py** — handles false_negatives, false_positives, and position_mismatches that *have* a correct model prediction:
+
+```bash
+python apply_fixes.py --data data/tracknet_merged --fix-positions --add-missed
+```
+
+- Removes all false_positives (delete bad labels)
+- `--fix-positions` updates position_mismatch rows to the model's prediction (requires min 20px delta)
+- `--add-missed` promotes false_negatives to visible labels (requires model conf ≥ 0.7)
+- Supports `--max-pm-frame` / `--max-fn-frame` cutoffs for partial reviews — only applies fixes to frames at or below a given frame number, so you can ship a half-reviewed iteration without losing the work
+
+**zero_neither_correct.py** — handles the `_neither/` subfolder from position_mismatch review:
+
+```bash
+python zero_neither_correct.py
+```
+
+Walks `output/disagreements/position_mismatch/_neither/{game}/{stem}.jpg` and zeros the matching `(game, stem)` rows — visibility=0, x=-1, y=-1. Keys by `(game, stem)` to avoid cross-game frame-number collisions.
+
+### Step 6 — Retrain
+
+Go back to step 1. Cleaned labels → better model → next audit exposes more subtle errors. In practice, 2-3 iterations flatten the quality curve.
+
+### Why this works
+
+Each round the model's errors are increasingly restricted to genuinely ambiguous frames (motion blur, occlusion near the hoop). The audit is strongest when model and labels *disagree on positive examples*, because that's where the signal-to-noise ratio of the existing label set is worst — the exact place auto-labeling fails. Step 2 is essentially "ask the model which of my labels it doesn't believe", and use that to prioritize human attention.
+
+### W&B integration
+
+The cleaned dataset, fixed CSVs, and audit counts are versioned as W&B artifacts on every run:
+
+- `tracknet-best:latest` — model weights per training run
+- `tracknet-labels:latest` — versioned `train.csv` / `val.csv` after each `apply_fixes.py` run
+- Audit summary metrics (FN/FP/PM counts, fix counts) logged per iteration
+
+**fetch_weights.py** pulls the latest weights from W&B onto a fresh machine so the loop can continue across devices:
+
+```bash
+python fetch_weights.py
+```
 
 ---
 
