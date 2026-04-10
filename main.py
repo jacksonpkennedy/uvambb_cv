@@ -69,7 +69,7 @@ VEL_HISTORY_LEN    = 15
 VEL_EXIT_THRESH    = 80
 
 # TrackNet — heatmap-based ball detection using 3 consecutive frames
-TRACKNET_WEIGHTS     = "runs/tracknet/weights/best.pt"  # path to trained TrackNet weights
+TRACKNET_WEIGHTS     = "runs/tracknet/weights/best_overall.pt"  # best across all training sessions
 TRACKNET_CONF_THRESH = 0.5                        # heatmap peak confidence threshold (lower for early training)
 TRACKNET_BALL_RADIUS = 15                          # pixels, for bbox synthesis from center point
 

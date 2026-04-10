@@ -6,8 +6,8 @@ Compares the trained model's predictions against the CSV labels to find:
   3. POSITION MISMATCH: both say ball, but positions differ >15px (wrong position)
 
 Usage:
-    python find_disagreements.py --data data/tracknet_merged --weights runs/tracknet/weights/best.pt
-    python find_disagreements.py --data data/tracknet_merged --weights runs/tracknet/weights/best.pt --visualize
+    python find_disagreements.py --data data/tracknet_merged --weights runs/tracknet/weights/best_session.pt
+    python find_disagreements.py --data data/tracknet_merged --weights runs/tracknet/weights/best_session.pt --visualize
 """
 import argparse
 import csv
@@ -226,8 +226,11 @@ def find_disagreements(data_dir: str, weights: str, visualize: bool = False,
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                                     (255, 255, 0), 1)
 
-                    fname = Path(entries[i2][0]).stem
-                    cv2.imwrite(str(out_dir / category / f"{fname}.jpg"), img)
+                    src_p = Path(entries[i2][0])
+                    game = src_p.parent.name
+                    game_dir = out_dir / category / game
+                    game_dir.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(game_dir / f"{src_p.stem}.jpg"), img)
                     vis_counts[category] += 1
 
             checked += 1
@@ -307,8 +310,8 @@ if __name__ == "__main__":
         description="Find disagreements between TrackNet and labels")
     parser.add_argument("--data", default="data/tracknet_merged",
                         help="Directory with train.csv / val.csv")
-    parser.add_argument("--weights", default="runs/tracknet/weights/best.pt",
-                        help="Trained TrackNet weights")
+    parser.add_argument("--weights", default="runs/tracknet/weights/best_session.pt",
+                        help="Trained TrackNet weights (use best_session.pt for cleaning)")
     parser.add_argument("--data-root",
                         default=os.environ.get("UVAMBB_DATA_ROOT"),
                         help="Root directory for frame data (or set UVAMBB_DATA_ROOT in .env)")
@@ -323,40 +326,80 @@ if __name__ == "__main__":
                        data_root=args.data_root)
     
 '''
-next steps:
-# Game 01: already used frames 0-5000, grab next 10k
-python auto_label_tracknet.py --video data/game_01.mp4 --output-dir data/tracknet_autolabels_01b --start-frame 5000 --max-frames 10000
+==============================================================================
+ITERATION WORKFLOW
+==============================================================================
 
-# Game 02: already used frames 0-13000, grab next 10k
-python auto_label_tracknet.py --video data/game_02.mp4 --output-dir data/tracknet_autolabels_02b --start-frame 13000 --max-frames 10000
+1) OPTIONAL: grab more frames and re-merge
+   python auto_label_tracknet.py --video data/game_01.mp4 \
+       --output-dir data/tracknet_autolabels_01b --start-frame 5000 --max-frames 10000
+   python merge_labels.py
+   python tracknet.py --preprocess --data data/tracknet_merged
 
-# Game 03: already used frames 0-10000, grab next 10k
-python auto_label_tracknet.py --video data/game_03.mp4 --output-dir data/tracknet_autolabels_03b --start-frame 10000 --max-frames 10000
-After all three finish, merge everything:
+2) RUN AUDIT (produces output/disagreements/{train,val}_{fn,fp,pm}.csv + images)
+   python find_disagreements.py --visualize --max-vis 2000
 
+   Visualizations are written to:
+     output/disagreements/{category}/{game}/{stem}.jpg
+   The {game} subfolder prevents cross-game stem collisions — if game_01,
+   game_02, and game_03 all have a frame_001578.jpg, you see all three.
 
-python merge_labels.py
-Then preprocess + retrain:
+3) MANUAL REVIEW — three folders, three decision rules:
 
+   A) false_negatives/{game}/  (label=none, model=ball)
+      KEEP image  → --add-missed will insert the model's position as a new label
+      DELETE image → row stays visibility=0 (model hallucination)
 
-python tracknet.py --preprocess --data data/tracknet_merged
-python tracknet.py --train --epochs 100 --batch 8
+   B) false_positives/{game}/  (label=ball, model=none)
+      KEEP image  → apply_fixes will zero out the bad label
+      DELETE image → row stays labeled (model missed a real ball)
 
+   C) position_mismatch/{game}/  (both see ball, positions differ)
+      This category has THREE possible outcomes, not two:
+        - label (red) is correct, model (green) is wrong
+            → DELETE image (label stays as-is, no change)
+        - model (green) is more accurate than label (red)
+            → KEEP image (fix-positions will overwrite label with model xy)
+        - NEITHER is correct (both off, ball elsewhere or not visible)
+            → MOVE image into position_mismatch/_neither/{game}/{stem}.jpg
+              so zero_neither_correct.py will zero the label.
 
-iteration review:
-False negatives (no label, model sees ball):
+   Partial review is OK in ANY category — not just position_mismatch. Track
+   the highest reviewed frame number PER CATEGORY separately.
 
-Delete images where model hallucinated → those stay as "no ball" (correct)
-Keep images where model found a real ball → --add-missed adds the label
+4) SYNC disagreement CSVs to match what's left in the folders
+   python sync_disagreements.py
 
-False positives (has label, model doesn't see ball):
+   This walks false_negatives/, false_positives/, position_mismatch/ and
+   keeps only the CSV rows whose (game, stem) image is still present.
+   The _neither/ subfolder is NOT used here — it's handled in step 5b.
+   The old disagreement CSVs are backed up to
+   output/disagreements/backups/<timestamp>/ before overwriting.
 
-Keep images where the label is genuinely wrong → apply_fixes removes the bad label
-Delete images where the label is actually correct (model missed it) → those stay labeled
+5a) APPLY FIXES — timestamped backup is taken automatically.
+    Use per-category cutoffs if you did a partial review of any category.
 
-how do i handle position mismatch because sometimes the red circle (label) is correct and sometimes the green circle (model) is correct
+   # Everything fully reviewed:
+   python apply_fixes.py --data data/tracknet_merged --fix-positions --add-missed
 
-Open output/disagreements/position_mismatch/
-For each image, if the red circle (label) is correct and model is wrong → delete the image
-If the green circle (model) is more accurate → keep the image
+   # Only position_mismatch was partial (reviewed up to frame 3513):
+   python apply_fixes.py --data data/tracknet_merged \
+       --fix-positions --add-missed --max-pm-frame 3513
+
+   # Or false_negatives was partial (reviewed up to frame 5000):
+   python apply_fixes.py --data data/tracknet_merged \
+       --fix-positions --add-missed --max-fn-frame 5000
+
+   # Any combination of --max-fp-frame / --max-pm-frame / --max-fn-frame works.
+
+5b) ZERO OUT "neither correct" position mismatches (if you used _neither/)
+   python zero_neither_correct.py
+
+   Walks output/disagreements/position_mismatch/_neither/{game}/{stem}.jpg
+   and zeros the matching (game, stem) rows. Takes its own backup.
+   Alternative: pass --list neither.txt where each line is "game/stem".
+
+6) RETRAIN
+   python tracknet.py --train --epochs 100 --batch 8
+
 '''
