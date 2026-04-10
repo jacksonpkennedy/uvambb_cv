@@ -330,76 +330,201 @@ if __name__ == "__main__":
 ITERATION WORKFLOW
 ==============================================================================
 
-1) OPTIONAL: grab more frames and re-merge
+0) BEFORE YOU START — prerequisites
+   - A trained TrackNet checkpoint must exist. For iteration cleanup use
+     runs/tracknet/weights/best_session.pt (current iteration's best),
+     NOT best_overall.pt — the all-time best may be from an older model
+     with different failure modes than your current data.
+   - UVAMBB_DATA_ROOT must be set in .env (or passed via --data-root) so
+     the audit can resolve frame paths stored as relative "data/..." strings.
+   - merge_labels.py must have been run so data/tracknet_merged/train.csv
+     and val.csv exist.
+
+1) OPTIONAL: add more frames and re-merge
    python auto_label_tracknet.py --video data/game_01.mp4 \
-       --output-dir data/tracknet_autolabels_01b --start-frame 5000 --max-frames 10000
+       --output-dir data/tracknet_autolabels_01b \
+       --start-frame 5000 --max-frames 10000
    python merge_labels.py
    python tracknet.py --preprocess --data data/tracknet_merged
 
-2) RUN AUDIT (produces output/disagreements/{train,val}_{fn,fp,pm}.csv + images)
+   Note: adding raw auto-labeled frames temporarily drops F1 because they
+   carry noise. Steps 2-5 win it back.
+
+2) RUN AUDIT
    python find_disagreements.py --visualize --max-vis 2000
 
-   Visualizations are written to:
-     output/disagreements/{category}/{game}/{stem}.jpg
+   Flags:
+     --data PATH           (default data/tracknet_merged)
+     --weights PATH        (default runs/tracknet/weights/best_session.pt)
+     --data-root PATH      (or set UVAMBB_DATA_ROOT in .env)
+     --visualize           save annotated JPGs into output/disagreements/
+     --max-vis N           per-category visualization cap (default 1000)
+
+   Internal thresholds (edit as file constants if needed):
+     CONF_THRESH    = 0.5   model confidence to count as a detection
+     DIST_THRESH_PX = 15    distance before flagging a position mismatch
+
+   Outputs:
+     output/disagreements/
+       {train,val}_false_negatives.csv
+       {train,val}_false_positives.csv
+       {train,val}_position_mismatch.csv
+       false_negatives/{game}/{stem}.jpg
+       false_positives/{game}/{stem}.jpg
+       position_mismatch/{game}/{stem}.jpg
    The {game} subfolder prevents cross-game stem collisions — if game_01,
-   game_02, and game_03 all have a frame_001578.jpg, you see all three.
+   game_02, and game_03 all have frame_001578.jpg, you see all three.
+
+   Narrowing the review set: if there are too many to review, raise
+   CONF_THRESH (e.g. 0.7) to see only high-confidence FN/PM, or raise
+   DIST_THRESH_PX (e.g. 25) to filter out near-miss PM.
 
 3) MANUAL REVIEW — three folders, three decision rules:
 
    A) false_negatives/{game}/  (label=none, model=ball)
-      KEEP image  → --add-missed will insert the model's position as a new label
+      KEEP image   → --add-missed inserts model's position as a new label
       DELETE image → row stays visibility=0 (model hallucination)
 
    B) false_positives/{game}/  (label=ball, model=none)
-      KEEP image  → apply_fixes will zero out the bad label
+      KEEP image   → apply_fixes zeroes out the bad label
       DELETE image → row stays labeled (model missed a real ball)
 
    C) position_mismatch/{game}/  (both see ball, positions differ)
-      This category has THREE possible outcomes, not two:
-        - label (red) is correct, model (green) is wrong
-            → DELETE image (label stays as-is, no change)
-        - model (green) is more accurate than label (red)
-            → KEEP image (fix-positions will overwrite label with model xy)
-        - NEITHER is correct (both off, ball elsewhere or not visible)
+      THREE possible outcomes:
+        - label (red) correct, model (green) wrong
+            → DELETE image (label stays as-is)
+        - model (green) more accurate than label (red)
+            → KEEP image (fix-positions overwrites label with model xy)
+        - NEITHER correct (ball elsewhere / not visible)
             → MOVE image into position_mismatch/_neither/{game}/{stem}.jpg
-              so zero_neither_correct.py will zero the label.
+              so zero_neither_correct.py zeroes the label.
 
-   Partial review is OK in ANY category — not just position_mismatch. Track
-   the highest reviewed frame number PER CATEGORY separately.
+   Partial review is OK in ANY category. Track the highest reviewed stem
+   number PER CATEGORY separately — review proceeds in filename-sorted
+   order. Each category has its own --max-*-frame flag in apply_fixes.
 
 4) SYNC disagreement CSVs to match what's left in the folders
    python sync_disagreements.py
 
-   This walks false_negatives/, false_positives/, position_mismatch/ and
-   keeps only the CSV rows whose (game, stem) image is still present.
-   The _neither/ subfolder is NOT used here — it's handled in step 5b.
-   The old disagreement CSVs are backed up to
-   output/disagreements/backups/<timestamp>/ before overwriting.
+   Flags:
+     --disagreements PATH  (default output/disagreements)
 
-5a) APPLY FIXES — timestamped backup is taken automatically.
-    Use per-category cutoffs if you did a partial review of any category.
+   Walks false_negatives/, false_positives/, position_mismatch/ and keeps
+   only CSV rows whose (game, stem) image is still present. The _neither/
+   subfolder is NOT used here — it's handled in step 5b. Backs up the
+   original disagreement CSVs to output/disagreements/backups/<ts>/.
 
-   # Everything fully reviewed:
-   python apply_fixes.py --data data/tracknet_merged --fix-positions --add-missed
+5a) APPLY FIXES
+    python apply_fixes.py --data data/tracknet_merged \
+        --fix-positions --add-missed
 
-   # Only position_mismatch was partial (reviewed up to frame 3513):
-   python apply_fixes.py --data data/tracknet_merged \
-       --fix-positions --add-missed --max-pm-frame 3513
+    Flags:
+      --data PATH             (default data/tracknet_merged)
+      --disagreements PATH    (default output/disagreements)
+      --fix-positions         apply PM fixes (else PM ignored)
+      --add-missed            apply FN additions (else FN ignored)
+      --min-dist PX           only fix PM if distance >= this (default 20)
+      --min-conf FLOAT        only add FN if model conf >= this (default 0.7)
+      --max-fp-frame N        partial FP review cutoff (only stems <= N)
+      --max-pm-frame N        partial PM review cutoff
+      --max-fn-frame N        partial FN review cutoff
+      --no-backup             skip timestamped backup (NOT recommended)
 
-   # Or false_negatives was partial (reviewed up to frame 5000):
-   python apply_fixes.py --data data/tracknet_merged \
-       --fix-positions --add-missed --max-fn-frame 5000
+    FP always runs when the CSV has rows. PM and FN are opt-in via
+    --fix-positions / --add-missed. Each --max-*-frame is independent;
+    leave unset for fully-reviewed categories.
 
-   # Any combination of --max-fp-frame / --max-pm-frame / --max-fn-frame works.
+    Priority per row: FP > PM > FN. A row matching multiple categories
+    only receives one treatment per run — removing a bad label wins over
+    repositioning it, which wins over adding back a missed label.
 
-5b) ZERO OUT "neither correct" position mismatches (if you used _neither/)
-   python zero_neither_correct.py
+    Timestamped backup lands at:
+      data/tracknet_merged/backups/<YYYYMMDD_HHMMSS>_apply_fixes/
+        train.csv  val.csv
 
-   Walks output/disagreements/position_mismatch/_neither/{game}/{stem}.jpg
-   and zeros the matching (game, stem) rows. Takes its own backup.
-   Alternative: pass --list neither.txt where each line is "game/stem".
+    Examples:
+      # Fully reviewed all three:
+      python apply_fixes.py --data data/tracknet_merged \
+          --fix-positions --add-missed
+
+      # PM partial to 3513, FN partial to 5000, FP fully reviewed:
+      python apply_fixes.py --data data/tracknet_merged \
+          --fix-positions --add-missed \
+          --max-pm-frame 3513 --max-fn-frame 5000
+
+      # Tighter thresholds (fix obvious PM only, add confident FN only):
+      python apply_fixes.py --data data/tracknet_merged \
+          --fix-positions --add-missed --min-dist 30 --min-conf 0.85
+
+5b) ZERO OUT "neither correct" position mismatches
+    (only if you used the _neither/ subfolder in step 3C)
+    python zero_neither_correct.py
+
+    Flags:
+      --data PATH          (default data/tracknet_merged)
+      --neither-dir PATH   (default output/disagreements/position_mismatch/_neither)
+      --list FILE          alternative: text file with "game/stem" per line
+      --no-backup          skip timestamped backup (NOT recommended)
+
+    Backup lands at:
+      data/tracknet_merged/backups/<YYYYMMDD_HHMMSS>_zero_neither/
 
 6) RETRAIN
    python tracknet.py --train --epochs 100 --batch 8
 
+   The .npy preprocessing cache does NOT need regeneration — it stores
+   resized frames, not labels. Label changes take effect next epoch.
+
+==============================================================================
+ROLLBACK / RECOVERY
+==============================================================================
+
+Every mutating step takes a timestamped backup.
+
+List backups:
+   ls data/tracknet_merged/backups/
+   ls output/disagreements/backups/       (disagreement CSV history)
+
+Restore a specific backup:
+   cp data/tracknet_merged/backups/<YYYYMMDD_HHMMSS_tag>/*.csv \
+      data/tracknet_merged/
+
+==============================================================================
+CAVEATS AND FAQ
+==============================================================================
+
+- CROSS-GAME STEM COLLISIONS: solved by {game}/{stem}.jpg layout. Every
+  lookup keys on (game, stem) tuple.
+
+- WHICH WEIGHTS FOR AUDIT: best_session.pt, not best_overall.pt. The
+  all-time best may be from an older iteration with different failure
+  modes that don't match current data.
+
+- VAL SET LABELS MATTER. Don't skip val rows — a wrong val label poisons
+  F1 every epoch. merge_labels.py splits deterministically (last 15% per
+  game), so a row stays in val across re-merges unless source order
+  changes. Clean val as aggressively as train.
+
+- FALSE NEGATIVE COUNT LOOKS HUGE? Expected on freshly-merged auto-labeled
+  data. The auto-labeler leaves visibility=0 on anything it wasn't sure
+  about; the model then sees balls in those frames and flags them as FN.
+  Review normally — most are genuine misses to recover via --add-missed.
+
+- APPLY_FIXES DID NOTHING? Two common causes:
+  (a) All PM rows have distance < --min-dist (lower --min-dist)
+  (b) All FN rows have conf < --min-conf (lower --min-conf)
+  The (game, stem) keying handles path-format differences, so mismatched
+  paths shouldn't be the cause anymore.
+
+- AUDIT IS SLOW? --max-vis only caps image writes, not CSV rows. The
+  bottleneck is running the model on every 3-frame triplet (~10 min/10k
+  frames on a single GPU).
+
+- DO I RERUN PREPROCESS AFTER CLEANING? No. Preprocess caches resized
+  frame images keyed by filename; label edits don't touch those files.
+  Rerun preprocess only when adding NEW frames or changing INPUT_W/H.
+
+- WHEN TO STOP ITERATING? F1 plateaus for 2-3 iterations in a row, or
+  the audit finds <1% disagreements. Label noise is then below the
+  model's own noise floor and further cleaning won't help.
 '''
