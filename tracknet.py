@@ -633,6 +633,18 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
     early_stop_pat = 15
     start_epoch    = 0
 
+    # Load best-ever F1 for overall tracking
+    overall_best_path = out_path / "best_overall.pt"
+    overall_best_f1 = 0.0
+    if overall_best_path.exists():
+        try:
+            meta = torch.load(str(out_path / "best_overall_meta.pt"),
+                              map_location="cpu", weights_only=True)
+            overall_best_f1 = meta.get("f1", 0.0)
+            print(f"  Best overall F1 so far: {overall_best_f1:.3f}")
+        except Exception:
+            pass
+
     # Resume from last checkpoint if requested
     ckpt_path = out_path / "last_ckpt.pt"
     if resume and ckpt_path.exists():
@@ -739,22 +751,32 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                     "lr": scheduler.get_last_lr()[0],
                 }
                 if (epoch + 1) % 5 == 0:
-                    log_dict["predictions"] = _wandb_prediction_samples(
-                        model, val_loader, device)
+                    try:
+                        log_dict["predictions"] = _wandb_prediction_samples(
+                            model, val_loader, device)
+                    except Exception as e:
+                        print(f"  W&B prediction viz skipped: {e}")
                 wandb.log(log_dict)
 
             if pe["f1"] > best_f1:
                 best_f1    = pe["f1"]
                 no_improve = 0
-                torch.save(model.state_dict(), str(out_path / "best.pt"))
-                print(f"  -> Saved best model (F1={best_f1:.3f})")
+                torch.save(model.state_dict(), str(out_path / "best_session.pt"))
+                print(f"  -> Saved best session model (F1={best_f1:.3f})")
+                # Update overall best if this session beat it
+                if best_f1 > overall_best_f1:
+                    overall_best_f1 = best_f1
+                    torch.save(model.state_dict(), str(out_path / "best_overall.pt"))
+                    torch.save({"f1": best_f1, "epoch": epoch + 1},
+                               str(out_path / "best_overall_meta.pt"))
+                    print(f"  -> New best overall model! (F1={overall_best_f1:.3f})")
                 if _HAS_WANDB:
                     art = wandb.Artifact(
                         "tracknet-best", type="model",
-                        description=f"TrackNet best.pt F1={best_f1:.3f} epoch={epoch+1}",
+                        description=f"TrackNet F1={best_f1:.3f} epoch={epoch+1}",
                         metadata={"f1": best_f1, "epoch": epoch + 1},
                     )
-                    art.add_file(str(out_path / "best.pt"))
+                    art.add_file(str(out_path / "best_session.pt"))
                     wandb.log_artifact(art)
             else:
                 no_improve += 1
@@ -787,10 +809,12 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                   f"{early_stop_pat} epochs (best F1={best_f1:.3f})")
             break
 
-    print(f"\nTraining complete. Best model: {out_path / 'best.pt'}")
+    print(f"\nTraining complete.")
+    print(f"  Best this session: {out_path / 'best_session.pt'} (F1={best_f1:.3f})")
+    print(f"  Best overall:      {out_path / 'best_overall.pt'} (F1={overall_best_f1:.3f})")
     if _HAS_WANDB:
         wandb.finish()
-    return str(out_path / "best.pt")
+    return str(out_path / "best_overall.pt")
 
 
 # ---------------------------------------------------------------------------
