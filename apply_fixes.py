@@ -5,24 +5,33 @@ Reads the disagreement CSVs and patches the training/val CSVs:
   - position_mismatch: optionally updates position to model's prediction
   - false_negatives: optionally adds labels where model detected a ball
 
+Rows are keyed by (game, stem) so the same frame number in different games
+is handled independently (prevents cross-game stem collisions).
+
+Per-category --max-*-frame flags support PARTIAL manual review: set a cutoff
+for any category you didn't finish reviewing. Fixes are only applied to
+frames with stem-number <= cutoff for that category. Categories you fully
+reviewed don't need a cutoff.
+
 Usage:
-    # Conservative: only remove bad labels
-    python apply_fixes.py --data data/tracknet_merged
-
-    # Also fix positions where model and label disagree by >20px
-    python apply_fixes.py --data data/tracknet_merged --fix-positions
-
-    # Also recover missed labels (review output/disagreements/false_negatives/ first!)
-    python apply_fixes.py --data data/tracknet_merged --add-missed --min-conf 0.7
-
-    # All fixes
+    # Fully reviewed all three categories:
     python apply_fixes.py --data data/tracknet_merged --fix-positions --add-missed
+
+    # Only reviewed position_mismatch up to frame 3513:
+    python apply_fixes.py --data data/tracknet_merged \
+        --fix-positions --add-missed --max-pm-frame 3513
+
+    # Reviewed everything EXCEPT false_negatives past frame 5000:
+    python apply_fixes.py --data data/tracknet_merged \
+        --fix-positions --add-missed --max-fn-frame 5000
 """
 import argparse
 import csv
 import os
-import shutil
+import re
 from pathlib import Path
+
+from csv_backup import backup_csvs
 
 try:
     import wandb
@@ -31,25 +40,46 @@ except ImportError:
     _HAS_WANDB = False
 
 
-def load_false_positives(disagree_dir: Path, split: str) -> set:
-    """Frame paths where label says ball but model doesn't see one."""
+_DIGIT_RE = re.compile(r"(\d+)(?!.*\d)")
+
+
+def _key(path: str) -> tuple[str, str]:
+    """(game, stem) identifier — unique across games."""
+    p = Path(path)
+    stem = p.stem.replace("_640x360", "")
+    return (p.parent.name, stem)
+
+
+def _frame_num(stem: str) -> int:
+    m = _DIGIT_RE.search(stem)
+    return int(m.group(1)) if m else -1
+
+
+def _under_cutoff(stem: str, cutoff: int | None) -> bool:
+    """True if this row should be touched given the per-category cutoff."""
+    if cutoff is None:
+        return True
+    return _frame_num(stem) <= cutoff
+
+
+def load_false_positives(disagree_dir: Path, split: str) -> set[tuple[str, str]]:
     fp_set = set()
     p = disagree_dir / f"{split}_false_positives.csv"
     if p.exists():
         with open(p) as f:
             for row in csv.DictReader(f):
-                fp_set.add(row["frame_path"])
+                fp_set.add(_key(row["frame_path"]))
     return fp_set
 
 
-def load_position_mismatches(disagree_dir: Path, split: str) -> dict:
-    """Frame paths where both see ball but positions differ."""
+def load_position_mismatches(disagree_dir: Path,
+                             split: str) -> dict[tuple[str, str], dict]:
     fixes = {}
     p = disagree_dir / f"{split}_position_mismatch.csv"
     if p.exists():
         with open(p) as f:
             for row in csv.DictReader(f):
-                fixes[row["frame_path"]] = {
+                fixes[_key(row["frame_path"])] = {
                     "pred_x": float(row["pred_x"]),
                     "pred_y": float(row["pred_y"]),
                     "dist": float(row["distance_px"]),
@@ -57,14 +87,14 @@ def load_position_mismatches(disagree_dir: Path, split: str) -> dict:
     return fixes
 
 
-def load_false_negatives(disagree_dir: Path, split: str) -> dict:
-    """Frame paths where model sees ball but label says none."""
+def load_false_negatives(disagree_dir: Path,
+                         split: str) -> dict[tuple[str, str], dict]:
     missed = {}
     p = disagree_dir / f"{split}_false_negatives.csv"
     if p.exists():
         with open(p) as f:
             for row in csv.DictReader(f):
-                missed[row["frame_path"]] = {
+                missed[_key(row["frame_path"])] = {
                     "pred_x": float(row["pred_x"]),
                     "pred_y": float(row["pred_y"]),
                     "pred_conf": float(row["pred_conf"]),
@@ -72,10 +102,13 @@ def load_false_negatives(disagree_dir: Path, split: str) -> dict:
     return missed
 
 
-def patch_csv(csv_path: str, fp_set: set, pos_fixes: dict, missed: dict,
+def patch_csv(csv_path: str,
+              fp_set: set, pos_fixes: dict, missed: dict,
               fix_positions: bool, add_missed: bool,
-              min_dist: float, min_conf: float) -> dict:
-    """Patch a training CSV in place. Returns stats."""
+              min_dist: float, min_conf: float,
+              max_fp_frame: int | None,
+              max_pm_frame: int | None,
+              max_fn_frame: int | None) -> dict:
     rows = []
     with open(csv_path) as f:
         for row in csv.DictReader(f):
@@ -84,64 +117,79 @@ def patch_csv(csv_path: str, fp_set: set, pos_fixes: dict, missed: dict,
     removed = 0
     repositioned = 0
     added = 0
+    skipped_fp = 0
+    skipped_pm = 0
+    skipped_fn = 0
 
     for row in rows:
-        fp = row["frame_path"]
+        k = _key(row["frame_path"])
+        stem = k[1]
 
         # 1) Remove false positives (bad labels)
-        if fp in fp_set and int(row["visibility"]) > 0:
-            row["visibility"] = "0"
-            row["x"] = "-1"
-            row["y"] = "-1"
-            removed += 1
-            continue
+        if k in fp_set and int(row["visibility"]) > 0:
+            if _under_cutoff(stem, max_fp_frame):
+                row["visibility"] = "0"
+                row["x"] = "-1"
+                row["y"] = "-1"
+                removed += 1
+                continue
+            else:
+                skipped_fp += 1
 
         # 2) Fix position mismatches (use model's prediction)
-        if fix_positions and fp in pos_fixes:
-            fix = pos_fixes[fp]
+        if fix_positions and k in pos_fixes:
+            fix = pos_fixes[k]
             if fix["dist"] >= min_dist and int(row["visibility"]) > 0:
-                row["x"] = f"{fix['pred_x']:.1f}"
-                row["y"] = f"{fix['pred_y']:.1f}"
-                repositioned += 1
-                continue
+                if _under_cutoff(stem, max_pm_frame):
+                    row["x"] = f"{fix['pred_x']:.1f}"
+                    row["y"] = f"{fix['pred_y']:.1f}"
+                    repositioned += 1
+                    continue
+                else:
+                    skipped_pm += 1
 
         # 3) Recover false negatives (add missed labels)
-        if add_missed and fp in missed:
-            m = missed[fp]
+        if add_missed and k in missed:
+            m = missed[k]
             if int(row["visibility"]) == 0 and m["pred_conf"] >= min_conf:
-                row["visibility"] = "1"
-                row["x"] = f"{m['pred_x']:.1f}"
-                row["y"] = f"{m['pred_y']:.1f}"
-                added += 1
+                if _under_cutoff(stem, max_fn_frame):
+                    row["visibility"] = "1"
+                    row["x"] = f"{m['pred_x']:.1f}"
+                    row["y"] = f"{m['pred_y']:.1f}"
+                    added += 1
+                else:
+                    skipped_fn += 1
 
-    # Write back
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["frame_path", "visibility", "x", "y"])
         writer.writeheader()
         writer.writerows(rows)
 
-    return {"removed": removed, "repositioned": repositioned,
-            "added": added, "total": len(rows)}
+    return {"removed": removed, "repositioned": repositioned, "added": added,
+            "skipped_fp": skipped_fp, "skipped_pm": skipped_pm,
+            "skipped_fn": skipped_fn, "total": len(rows)}
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Apply label fixes from disagreement analysis")
-    parser.add_argument("--data", default="data/tracknet_merged",
-                        help="Directory with train.csv / val.csv")
-    parser.add_argument("--disagreements", default="output/disagreements",
-                        help="Directory with disagreement CSVs from find_disagreements.py")
-    parser.add_argument("--fix-positions", action="store_true",
-                        help="Update position mismatches to model predictions")
-    parser.add_argument("--add-missed", action="store_true",
-                        help="Add labels for false negatives (model found ball, no label). "
-                             "Review output/disagreements/false_negatives/ visually first!")
-    parser.add_argument("--min-dist", type=float, default=20.0,
-                        help="Only fix positions with distance >= this (default 20px)")
-    parser.add_argument("--min-conf", type=float, default=0.7,
-                        help="Only add missed labels above this model confidence (default 0.7)")
+    parser.add_argument("--data", default="data/tracknet_merged")
+    parser.add_argument("--disagreements", default="output/disagreements")
+    parser.add_argument("--fix-positions", action="store_true")
+    parser.add_argument("--add-missed", action="store_true")
+    parser.add_argument("--min-dist", type=float, default=20.0)
+    parser.add_argument("--min-conf", type=float, default=0.7)
+    parser.add_argument("--max-fp-frame", type=int, default=None,
+                        help="Only apply false-positive removal to stems with "
+                             "frame number <= this (for partial FP review)")
+    parser.add_argument("--max-pm-frame", type=int, default=None,
+                        help="Only apply position fixes to stems with "
+                             "frame number <= this (for partial PM review)")
+    parser.add_argument("--max-fn-frame", type=int, default=None,
+                        help="Only add missed labels for stems with "
+                             "frame number <= this (for partial FN review)")
     parser.add_argument("--no-backup", action="store_true",
-                        help="Skip creating .bak backup of original CSVs")
+                        help="Skip timestamped backup (NOT recommended)")
     args = parser.parse_args()
 
     disagree_dir = Path(args.disagreements)
@@ -149,9 +197,11 @@ def main():
         print(f"Error: {disagree_dir} not found. Run find_disagreements.py first.")
         return
 
-    total_removed = 0
-    total_repositioned = 0
-    total_added = 0
+    if not args.no_backup:
+        backup_csvs(args.data, tag="apply_fixes")
+
+    total = {"removed": 0, "repositioned": 0, "added": 0,
+             "skipped_fp": 0, "skipped_pm": 0, "skipped_fn": 0}
 
     for split in ("train", "val"):
         csv_path = Path(args.data) / f"{split}.csv"
@@ -159,40 +209,38 @@ def main():
             print(f"Skipping {split}: {csv_path} not found")
             continue
 
-        # Backup original
-        if not args.no_backup:
-            bak = csv_path.with_suffix(f".csv.bak")
-            shutil.copy2(csv_path, bak)
-            print(f"Backed up {csv_path} -> {bak}")
-
-        # Load disagreements
         fp_set = load_false_positives(disagree_dir, split)
         pos_fixes = load_position_mismatches(disagree_dir, split)
         missed = load_false_negatives(disagree_dir, split)
 
         print(f"\n{split.upper()}:")
-        print(f"  False positives to remove:    {len(fp_set)}")
+        print(f"  False positives to remove:    {len(fp_set)}"
+              + (f" [cutoff <= {args.max_fp_frame}]" if args.max_fp_frame else ""))
         print(f"  Position mismatches found:    {len(pos_fixes)}"
-              + (f" (fixing >= {args.min_dist:.0f}px)" if args.fix_positions else " (skipping, use --fix-positions)"))
+              + (f" (fixing >= {args.min_dist:.0f}px)" if args.fix_positions else " (skipping)")
+              + (f" [cutoff <= {args.max_pm_frame}]" if args.max_pm_frame else ""))
         print(f"  False negatives found:        {len(missed)}"
-              + (f" (adding conf >= {args.min_conf:.2f})" if args.add_missed else " (skipping, use --add-missed)"))
+              + (f" (adding conf >= {args.min_conf:.2f})" if args.add_missed else " (skipping)")
+              + (f" [cutoff <= {args.max_fn_frame}]" if args.max_fn_frame else ""))
 
         stats = patch_csv(str(csv_path), fp_set, pos_fixes, missed,
                           args.fix_positions, args.add_missed,
-                          args.min_dist, args.min_conf)
+                          args.min_dist, args.min_conf,
+                          args.max_fp_frame, args.max_pm_frame, args.max_fn_frame)
 
-        total_removed += stats["removed"]
-        total_repositioned += stats["repositioned"]
-        total_added += stats["added"]
+        for k in total:
+            total[k] += stats[k]
 
-        print(f"  -> Removed {stats['removed']} bad labels")
+        print(f"  -> Removed {stats['removed']} bad labels"
+              + (f" (skipped {stats['skipped_fp']} past cutoff)" if stats['skipped_fp'] else ""))
         if args.fix_positions:
-            print(f"  -> Repositioned {stats['repositioned']} labels")
+            print(f"  -> Repositioned {stats['repositioned']} labels"
+                  + (f" (skipped {stats['skipped_pm']} past cutoff)" if stats['skipped_pm'] else ""))
         if args.add_missed:
-            print(f"  -> Added {stats['added']} missed labels")
+            print(f"  -> Added {stats['added']} missed labels"
+                  + (f" (skipped {stats['skipped_fn']} past cutoff)" if stats['skipped_fn'] else ""))
         print(f"  -> Total rows: {stats['total']}")
 
-    # Log fix stats to W&B for tracking label quality over iterations
     if _HAS_WANDB:
         wandb.init(
             project=os.environ.get("WANDB_PROJECT", "uvambb-cv"),
@@ -201,11 +249,10 @@ def main():
             name="apply-fixes",
         )
         wandb.log({
-            "fixes/removed": total_removed,
-            "fixes/repositioned": total_repositioned,
-            "fixes/added": total_added,
+            "fixes/removed": total["removed"],
+            "fixes/repositioned": total["repositioned"],
+            "fixes/added": total["added"],
         })
-        # Upload cleaned CSVs as versioned dataset artifact
         art = wandb.Artifact("tracknet-labels", type="dataset")
         for split in ("train", "val"):
             p = Path(args.data) / f"{split}.csv"

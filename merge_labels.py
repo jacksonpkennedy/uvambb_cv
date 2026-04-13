@@ -25,6 +25,8 @@ SOURCES = [
     "data/tracknet_labels/val.csv",
     "data/tracknet_autolabels/train.csv",
     "data/tracknet_autolabels/val.csv",
+    "data/tracknet_autolabels_01b/train.csv",
+    "data/tracknet_autolabels_01b/val.csv",
     "data/tracknet_autolabels_02/train.csv",
     "data/tracknet_autolabels_02/val.csv",
     "data/tracknet_autolabels_03/train.csv",
