@@ -651,7 +651,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
 
     best_f1        = 0.0
     no_improve     = 0       # epochs since best F1 improved
-    early_stop_pat = 5
+    early_stop_pat = 8
     start_epoch    = 0
 
     # Load best-ever F1 for overall tracking

@@ -81,8 +81,11 @@ OCR_CONFIRM_COUNT  = 2      # need this many consistent reads to lock a jersey n
 BALL_COURT_X_PAD     = 0.05    # horizontal slack beyond court edges (fraction of frame_w)
 BALL_MAX_BBOX_AREA   = 2500    # max ball bbox area in pixels (at 1080p) — rejects bald heads
 BALL_MIN_BBOX_AREA   = 50      # min ball bbox area — rejects noise
-BALL_MAX_TELEPORT_PX = 250     # max pixels ball can move per frame (at 1080p, 60fps)
+BALL_MAX_TELEPORT_PX = 50     # max pixels ball can move per frame (at 1080p, 60fps)
 BALL_TELEPORT_GRACE  = 10      # frames since last sighting before teleport check resets
+BALL_TEMPORAL_WINDOW = 5       # look-back window for temporal consistency
+BALL_TEMPORAL_MIN    = 3       # require N of WINDOW recent frames in same region
+BALL_TEMPORAL_RADIUS = 80      # max px spread to count as "same region" (at 1080p)
 
 # Ball interpolation — fill gaps in detection using confirmed neighbors
 BALL_INTERP_BUFFER   = 20      # frames to buffer for look-ahead (~333ms at 60fps)
@@ -829,6 +832,8 @@ class BallValidator:
         self._near_hoop_frame: int = -999      # last frame ball was near a hoop
         self._near_hoop_box: list | None = None # the hoop box it was near
         self._max_teleport = BALL_MAX_TELEPORT_PX * (frame_w / 1920.0)
+        self._temporal_radius = BALL_TEMPORAL_RADIUS * (frame_w / 1920.0)
+        self._recent_candidates: deque = deque(maxlen=BALL_TEMPORAL_WINDOW)
 
     def filter(self, frame_idx: int, ball_dets: list,
                hoop_dets: list) -> list:
@@ -846,48 +851,76 @@ class BallValidator:
             # --- Check 2: Teleport rejection ---
             if self._last_center is not None:
                 gap = frame_idx - self._last_frame
+                dist = math.hypot(cx - self._last_center[0],
+                                  cy - self._last_center[1])
                 if 0 < gap <= BALL_TELEPORT_GRACE:
-                    dist = math.hypot(cx - self._last_center[0],
-                                      cy - self._last_center[1])
                     if dist > self._max_teleport * gap:
                         continue
+                else:
+                    # Beyond grace: allow re-acquisition but only with
+                    # temporal consistency (checked below)
+                    pass
 
             # --- Check 3: Backboard constraint ---
-            # If ball was near a hoop recently, reject detections that jump
-            # ABOVE the hoop into the crowd. Ball can go past horizontally
-            # (airball/bounce) but can't teleport upward into the stands.
             if (self._near_hoop_box is not None and
                     frame_idx - self._near_hoop_frame <= 30):
-                hoop_top = self._near_hoop_box[1]  # top Y of hoop box
-                # Ball can't be significantly above the hoop AND past it
-                # horizontally — that's the crowd/backboard area
+                hoop_top = self._near_hoop_box[1]
                 hoop_cx = (self._near_hoop_box[0] + self._near_hoop_box[2]) / 2.0
                 court_cx = self._frame_w / 2.0
                 above_hoop = cy < hoop_top - self._frame_h * 0.03
                 if above_hoop:
                     if hoop_cx < court_cx and cx < hoop_cx:
-                        continue  # above & behind left hoop
+                        continue
                     elif hoop_cx >= court_cx and cx > hoop_cx:
-                        continue  # above & behind right hoop
+                        continue
 
             valid.append(d)
 
-        # Update history with the best valid detection
+        # Pick the best candidate this frame (highest confidence)
+        best_det = None
         if valid:
-            best = max(valid, key=lambda d: (d["box"][2] - d["box"][0]) *
-                                             (d["box"][3] - d["box"][1]))
-            bcx = (best["box"][0] + best["box"][2]) / 2.0
-            bcy = (best["box"][1] + best["box"][3]) / 2.0
+            best_det = max(valid, key=lambda d: d.get("conf", 0.0))
+            bcx = (best_det["box"][0] + best_det["box"][2]) / 2.0
+            bcy = (best_det["box"][1] + best_det["box"][3]) / 2.0
+            self._recent_candidates.append((frame_idx, bcx, bcy))
+        else:
+            self._recent_candidates.append((frame_idx, None, None))
+
+        # --- Check 4: Temporal consistency ---
+        # Continuing an active track: accept immediately (no delay).
+        # Re-acquiring after a gap/jump: require N-of-M clustering first
+        # to prevent locking onto a face or random object.
+        if best_det is not None:
+            bcx = (best_det["box"][0] + best_det["box"][2]) / 2.0
+            bcy = (best_det["box"][1] + best_det["box"][3]) / 2.0
+
+            continuing_track = False
+            if self._last_center is not None:
+                gap = frame_idx - self._last_frame
+                dist = math.hypot(bcx - self._last_center[0],
+                                  bcy - self._last_center[1])
+                if gap <= BALL_TELEPORT_GRACE and dist <= self._max_teleport * gap:
+                    continuing_track = True
+
+            if not continuing_track:
+                nearby = 0
+                for _, rx, ry in self._recent_candidates:
+                    if rx is not None:
+                        if math.hypot(bcx - rx, bcy - ry) <= self._temporal_radius:
+                            nearby += 1
+                if nearby < BALL_TEMPORAL_MIN:
+                    return []
+
             self._last_center = (bcx, bcy)
             self._last_frame = frame_idx
-            # Track if ball is near a hoop (for backboard constraint)
             for h in hoop_dets:
                 if self._near_any_hoop(bcx, bcy, [h]):
                     self._near_hoop_frame = frame_idx
                     self._near_hoop_box = h["box"]
                     break
+            return [best_det]
 
-        return valid
+        return []
 
     def _near_any_hoop(self, cx: float, cy: float, hoop_dets: list) -> bool:
         margin = self._frame_w * 0.08
