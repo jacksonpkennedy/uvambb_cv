@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-A basketball analysis pipeline that detects, tracks, and annotates players, referees, the basketball, and the hoop from game footage using a fine-tuned YOLO11s model with ByteTrack multi-object tracking, TrackNet heatmap-based ball detection with test-time augmentation, Kalman-filtered ball trajectory smoothing, pose estimation, jersey number OCR, temporal interpolation with outlier rejection, and automatic team classification.
+A basketball analysis pipeline that detects, tracks, and annotates players, referees, the basketball, and the hoop from game footage using a fine-tuned YOLO11s model with ByteTrack multi-object tracking, TrackNet heatmap-based ball detection with test-time augmentation, velocity-aware ball validation with head-lock rejection, Kalman-filtered ball trajectory smoothing, auto-detected court ROI, pose estimation, jersey number OCR, stability-gated temporal interpolation, and automatic team classification.
 
 **Team Members:**
 - Jackson Kennedy
@@ -40,14 +40,17 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
           │                                   │                      │
           │                        ┌──────────▼───────────────┐      │
           │                        │     BALL VALIDATION      │      │
-          │                        │  Court region → Teleport │      │
-          │                        │  → Backboard constraint  │      │
+          │                        │  Court ROI (auto) →      │      │
+          │                        │  Velocity-aware teleport │      │
+          │                        │  (cold-start pathway) →  │      │
+          │                        │  Backboard → Temporal    │      │
+          │                        │  consistency → Head-lock │      │
           │                        └──────────┬───────────────┘      │
           │                                   │                      │
           │                        ┌──────────▼───────────────┐      │
           │                        │   KALMAN FILTER          │      │
           │                        │   4-state constant-vel   │      │
-          │                        │   Smooths trajectory     │      │
+          │                        │   Velocity-aware reset   │      │
           │                        └──────────┬───────────────┘      │
           │                                   │                      │
           └────────────────────────┬──────────┘──────────────────────┘
@@ -75,6 +78,8 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
                               │      INTERPOLATION BUFFER       │
                               │  20-frame look-ahead            │
                               │  Outlier rejection (1-3 spikes) │
+                              │  Stability-gated endpoints      │
+                              │  (majority-vote cluster check)  │
                               │  Linear + arc gap filling       │
                               └────────┬────────────────────────┘
                                        │
@@ -91,9 +96,11 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
 | Detection | YOLO11s (fine-tuned) | Fine-tuned for players/hoop/ref (4 classes) |
 | Tracking | ByteTrack | Custom config — 4s track buffer, low thresholds for ball |
 | Ball Detection | TrackNet (primary) | Encoder-decoder heatmap regression with U-Net skip connections on 3 consecutive frames (11-ch input: 9 RGB + 2 motion diff maps) with TTA |
-| Ball Validation | BallValidator | Court region, teleport rejection, backboard constraint |
-| Ball Interpolation | BallInterpolator | 20-frame look-ahead buffer, relative outlier rejection (1-3 frame spikes), linear + parabolic gap filling |
-| Ball Tracker | BallTracker | Picks highest-confidence detection, Kalman filter (constant-velocity model) for trajectory smoothing, maintains velocity history |
+| Ball Validation | BallValidator | Auto-detected court ROI, velocity-aware teleport (with cold-start pathway for pass/shot starts), backboard constraint, temporal consistency, head-lock rejection via pose keypoints |
+| Ball Interpolation | BallInterpolator | 20-frame look-ahead buffer, relative outlier rejection (1-3 frame spikes), stability-gated endpoints (majority-vote clustering), linear + parabolic gap filling |
+| Ball Tracker | BallTracker | Picks highest-confidence detection, Kalman filter (constant-velocity model) for trajectory smoothing with velocity-aware reset threshold, maintains velocity history |
+| Court ROI | detect_court_roi | Auto-detects court polygon from first 30 frames using multi-color surface segmentation (wood, blue/red paint, white lines) + convex hull; falls back to hardcoded trapezoid |
+| Head-Lock Detector | HeadLockDetector | Tracks offset between ball candidate and nearest head keypoint per player; if offset stays near-constant over 20 frames (low std-dev), rejects as bald-head false positive |
 | Pose Estimation | YOLO11n-pose | 17-point COCO skeleton, every processed frame |
 | Jersey OCR | EasyOCR | Adaptive frequency (every 30 frames unconfirmed, 90 confirmed), majority voting |
 | Player Re-ID | TemporalReIDBuffer | Jersey-based matching (ignores distance) + proximity fallback (300px), 10s memory |

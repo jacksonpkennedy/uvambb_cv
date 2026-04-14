@@ -81,11 +81,12 @@ OCR_CONFIRM_COUNT  = 2      # need this many consistent reads to lock a jersey n
 BALL_COURT_X_PAD     = 0.05    # horizontal slack beyond court edges (fraction of frame_w)
 BALL_MAX_BBOX_AREA   = 2500    # max ball bbox area in pixels (at 1080p) — rejects bald heads
 BALL_MIN_BBOX_AREA   = 50      # min ball bbox area — rejects noise
-BALL_MAX_TELEPORT_PX = 50     # max pixels ball can move per frame (at 1080p, 60fps)
+BALL_MAX_TELEPORT_PX = 200    # max pixels ball can move per frame (at 1080p, 60fps)
 BALL_TELEPORT_GRACE  = 10      # frames since last sighting before teleport check resets
 BALL_TEMPORAL_WINDOW = 5       # look-back window for temporal consistency
-BALL_TEMPORAL_MIN    = 3       # require N of WINDOW recent frames in same region
-BALL_TEMPORAL_RADIUS = 80      # max px spread to count as "same region" (at 1080p)
+BALL_TEMPORAL_MIN    = 2       # require N of WINDOW recent frames in same region
+BALL_TEMPORAL_RADIUS = 120     # max px spread to count as "same region" (at 1080p)
+BALL_VELOCITY_HISTORY = 5      # frames of velocity history for motion prediction
 
 # Ball interpolation — fill gaps in detection using confirmed neighbors
 BALL_INTERP_BUFFER   = 20      # frames to buffer for look-ahead (~333ms at 60fps)
@@ -503,7 +504,11 @@ class BallTracker:
         # Observation model: z = H * x  (we observe x,y only)
         self._kf_H = np.array([[1,0,0,0],[0,1,0,0]], dtype=np.float64)
         self._kf_R = np.eye(2, dtype=np.float64) * 15.0  # measurement noise
-        self._kf_Q = np.eye(4, dtype=np.float64) * 0.5   # process noise
+        # Process noise: low on position (model is fairly accurate), higher
+        # on velocity (ball accelerates during shots/bounces/passes, so the
+        # constant-velocity assumption is violated — KF needs to trust
+        # measurements more during acceleration).
+        self._kf_Q = np.diag([0.5, 0.5, 4.0, 4.0]).astype(np.float64)
 
     def _kf_init(self, cx: float, cy: float) -> None:
         self._kf_x = np.array([[cx],[cy],[0.0],[0.0]], dtype=np.float64)
@@ -539,62 +544,80 @@ class BallTracker:
         return self._frames_since
 
     def update(self, frame_idx: int, ball_dets: list) -> list:
-        """Return best ball detection with Kalman-smoothed center."""
+        """Pick best detection and apply Kalman smoothing.
+
+        Teleport/motion filtering is handled upstream in BallValidator — this
+        class only picks highest-confidence candidate and smooths jitter.
+        Kalman reset threshold is velocity-aware so acceleration doesn't
+        cause constant resets.
+        """
         self._frames_since = frame_idx - self._last_seen_frame
+
         if not ball_dets:
-            # Propagate Kalman prediction even when ball not detected
             self._kf_predict()
             return []
 
-        # Pick highest confidence detection
+        # Pick best (validator already did teleport/head filtering)
         best = max(ball_dets, key=lambda d: d.get("conf", 0.5))
         raw_cx = (best["box"][0] + best["box"][2]) / 2.0
         raw_cy = (best["box"][1] + best["box"][3]) / 2.0
 
-        # Reset Kalman on large jumps (teleport) to avoid filter divergence
-        if (self._kf_x is not None and self._frames_since <= 5):
-            kf_cx = float(self._kf_x[0, 0])
-            kf_cy = float(self._kf_x[1, 0])
-            if np.hypot(raw_cx - kf_cx, raw_cy - kf_cy) > BALL_MAX_TELEPORT_PX:
+        # Velocity-aware Kalman reset: the KF uses a constant-velocity model,
+        # so during acceleration (shot release, bounce, pass start) the
+        # measurement legitimately diverges from the prediction. Scale the
+        # reset threshold by current KF-estimated speed so we don't reset
+        # every time the ball accelerates.
+        if self._kf_x is not None and self._frames_since <= 5:
+            kf_cx, kf_cy = float(self._kf_x[0, 0]), float(self._kf_x[1, 0])
+            kf_vx, kf_vy = float(self._kf_x[2, 0]), float(self._kf_x[3, 0])
+            kf_speed = math.hypot(kf_vx, kf_vy)
+            reset_thresh = max(BALL_MAX_TELEPORT_PX, kf_speed * 2.5)
+            if np.hypot(raw_cx - kf_cx, raw_cy - kf_cy) > reset_thresh:
                 self._kf_x = None
 
         self._kf_predict()
         smooth_cx, smooth_cy = self._kf_update(raw_cx, raw_cy)
 
-        # Rebuild box around smoothed center using original box dimensions
-        bw = best["box"][2] - best["box"][0]
-        bh = best["box"][3] - best["box"][1]
+        bw, bh = best["box"][2] - best["box"][0], best["box"][3] - best["box"][1]
         smoothed_box = [
             int(smooth_cx - bw / 2), int(smooth_cy - bh / 2),
             int(smooth_cx + bw / 2), int(smooth_cy + bh / 2),
         ]
-        best = dict(best)   # don't mutate the original
+
+        best = dict(best)
         best["box"] = smoothed_box
 
-        # Update velocity history (using raw center to avoid Kalman feedback loop)
-        if self._last_box is not None and self._frames_since <= 3:
+        # Update velocity history (used for any external consumers / logging)
+        if self._last_box is not None:
             gap = max(1, self._frames_since)
-            vx = (raw_cx - self._last_cx) / gap
-            vy = (raw_cy - self._last_cy) / gap
-            self._vel_history.append((vx, vy))
-        elif self._frames_since > 10:
-            self._vel_history.clear()
+            self._vel_history.append(
+                ((raw_cx - self._last_cx) / gap, (raw_cy - self._last_cy) / gap))
 
         self._last_box = smoothed_box
-        self._last_cx = raw_cx
-        self._last_cy = raw_cy
+        self._last_cx, self._last_cy = raw_cx, raw_cy
         self._last_seen_frame = frame_idx
         return [best]
-
 
 class BallInterpolator:
     """Buffer frames and fill ball detection gaps using confirmed neighbors.
     Since this is post-game review, we can look ahead before finalizing output.
-    Uses a sliding window of BALL_INTERP_BUFFER frames."""
+    Uses a sliding window of BALL_INTERP_BUFFER frames.
+
+    Stability requirement: interpolation only uses endpoints that pass a
+    majority vote — MIN_STABLE of STABLE_WINDOW recent frames must have
+    detections clustering within STABLE_RADIUS. This prevents interpolating
+    toward a head or false positive that the model briefly locks onto.
+    """
+
+    STABLE_WINDOW = 8   # frames to look back/forward for stability check
+    MIN_STABLE = 2      # require 2 of 8 frames to agree (tolerates ~44% recall)
+    STABLE_RADIUS = 180  # max px spread within a stable cluster (at 1080p)
 
     def __init__(self, max_teleport: float):
         self._buffer: deque = deque()  # deque of (frame_image, ball_box_or_None)
         self._max_teleport = max_teleport
+        # Scale stable radius proportionally to teleport (both are resolution-dependent)
+        self._stable_radius = self.STABLE_RADIUS * (max_teleport / BALL_MAX_TELEPORT_PX)
 
     def push(self, frame: np.ndarray, ball_box: list | None, label: str | None = None):
         """Add a frame and its ball detection (or None) to the buffer."""
@@ -753,8 +776,43 @@ class BallInterpolator:
                     frame_img = self._buffer[i + k][0]
                     self._buffer[i + k] = (frame_img, None, None)
 
+    def _is_stable_before(self, idx: int) -> bool:
+        """Check if MIN_STABLE of STABLE_WINDOW frames ending at idx have
+        detections clustering within STABLE_RADIUS (majority-vote, gaps OK)."""
+        if idx < 0 or self._buffer[idx][1] is None:
+            return False
+        ref = self._buffer[idx][1]
+        count = 0
+        start = max(idx - self.STABLE_WINDOW + 1, 0)
+        for j in range(start, idx + 1):
+            box = self._buffer[j][1]
+            if box is not None and self._box_dist(ref, box) <= self._stable_radius:
+                count += 1
+        return count >= self.MIN_STABLE
+
+    def _is_stable_after(self, idx: int) -> bool:
+        """Check if MIN_STABLE of STABLE_WINDOW frames starting at idx have
+        detections clustering within STABLE_RADIUS (majority-vote, gaps OK)."""
+        n = len(self._buffer)
+        if idx >= n or self._buffer[idx][1] is None:
+            return False
+        ref = self._buffer[idx][1]
+        count = 0
+        end = min(idx + self.STABLE_WINDOW, n)
+        for j in range(idx, end):
+            box = self._buffer[j][1]
+            if box is not None and self._box_dist(ref, box) <= self._stable_radius:
+                count += 1
+        return count >= self.MIN_STABLE
+
     def _fill_gaps(self):
-        """Reject outlier spikes, then fill gaps with interpolated positions."""
+        """Reject outlier spikes, then fill gaps with interpolated positions.
+
+        Interpolation only happens when BOTH endpoints are stable (part of a
+        run of MIN_STABLE consecutive, spatially consistent detections). This
+        prevents interpolating from a real ball position toward a head or
+        false positive that the model briefly locks onto.
+        """
         self._reject_outliers()
         n = len(self._buffer)
         i = 0
@@ -778,6 +836,12 @@ class BallInterpolator:
             box_before = self._buffer[gap_start - 1][1]
             box_after  = self._buffer[gap_end][1]
             if box_before is None or box_after is None:
+                continue
+
+            # Both endpoints must be stable (part of a consistent detection run)
+            if not self._is_stable_before(gap_start - 1):
+                continue
+            if not self._is_stable_after(gap_end):
                 continue
 
             # Check distance is reasonable
@@ -914,10 +978,13 @@ class BallValidator:
         self._last_frame: int = -999
         self._near_hoop_frame: int = -999      # last frame ball was near a hoop
         self._near_hoop_box: list | None = None # the hoop box it was near
-        self._max_teleport = BALL_MAX_TELEPORT_PX * (frame_w / 1920.0)
-        self._temporal_radius = BALL_TEMPORAL_RADIUS * (frame_w / 1920.0)
+        self._scale = frame_w / 1920.0
+        self._max_teleport = BALL_MAX_TELEPORT_PX * self._scale
+        self._temporal_radius = BALL_TEMPORAL_RADIUS * self._scale
         self._recent_candidates: deque = deque(maxlen=BALL_TEMPORAL_WINDOW)
         self._headlock = HeadLockDetector(frame_w)
+        # Velocity tracking: list of (vx, vy) per-frame deltas
+        self._velocity_history: deque = deque(maxlen=BALL_VELOCITY_HISTORY)
 
     def filter(self, frame_idx: int, ball_dets: list,
                hoop_dets: list, pose_map: dict | None = None) -> list:
@@ -932,14 +999,30 @@ class BallValidator:
             if not ball_in_court_region(self._roi_poly, cx, cy, self._frame_w):
                 continue
 
-            # --- Check 2: Teleport rejection ---
+            # --- Check 2: Velocity-aware teleport rejection ---
+            # Standard rule: allowed = max(base_teleport, speed * 2.5) * gap.
+            # Cold-start pathway: when velocity is ~0 (ball held, dead ball,
+            # or just established), we have no motion history to justify a
+            # large jump.  But pass/shot initiations legitimately exceed the
+            # base teleport on frame 1.  To avoid killing every pass start,
+            # allow a larger one-off jump when cold-started.  If the jump is
+            # a head-lock false positive, the HeadLockDetector and next-frame
+            # teleport check will reject it within a few frames.
             if self._last_center is not None:
                 gap = frame_idx - self._last_frame
                 dist = math.hypot(cx - self._last_center[0],
                                   cy - self._last_center[1])
                 if 0 < gap <= BALL_TELEPORT_GRACE:
-                    if dist > self._max_teleport * gap:
-                        continue
+                    speed = self._current_speed()
+                    allowed = max(self._max_teleport, speed * 2.5) * gap
+                    if dist > allowed:
+                        # Cold-start: no velocity to extrapolate from
+                        cold_start = speed < 15.0 * self._scale
+                        cold_start_limit = 350.0 * self._scale * gap
+                        if cold_start and dist <= cold_start_limit:
+                            pass  # tentatively accept the jump
+                        else:
+                            continue
                 else:
                     # Beyond grace: allow re-acquisition but only with
                     # temporal consistency (checked below)
@@ -983,7 +1066,9 @@ class BallValidator:
                 gap = frame_idx - self._last_frame
                 dist = math.hypot(bcx - self._last_center[0],
                                   bcy - self._last_center[1])
-                if gap <= BALL_TELEPORT_GRACE and dist <= self._max_teleport * gap:
+                speed = self._current_speed()
+                allowed = max(self._max_teleport, speed * 2.5) * gap
+                if gap <= BALL_TELEPORT_GRACE and dist <= allowed:
                     continuing_track = True
 
             if not continuing_track:
@@ -1005,7 +1090,18 @@ class BallValidator:
                 self._last_center = None
                 self._last_frame = -999
                 self._recent_candidates.clear()
+                self._velocity_history.clear()
                 return []
+
+            # Update velocity history
+            if self._last_center is not None:
+                gap = frame_idx - self._last_frame
+                if 0 < gap <= 3:  # only track velocity from nearby frames
+                    vx = (bcx - self._last_center[0]) / gap
+                    vy = (bcy - self._last_center[1]) / gap
+                    self._velocity_history.append((vx, vy))
+            else:
+                self._velocity_history.clear()
 
             self._last_center = (bcx, bcy)
             self._last_frame = frame_idx
@@ -1020,6 +1116,13 @@ class BallValidator:
         # a "miss" so offset histories don't stale (they'll be pruned
         # naturally since no tid will match next frame).
         return []
+
+    def _current_speed(self) -> float:
+        """Average speed (px/frame) from recent velocity history."""
+        if not self._velocity_history:
+            return 0.0
+        speeds = [math.hypot(vx, vy) for vx, vy in self._velocity_history]
+        return sum(speeds) / len(speeds)
 
     def _near_any_hoop(self, cx: float, cy: float, hoop_dets: list) -> bool:
         margin = self._frame_w * 0.08
@@ -1068,6 +1171,7 @@ def is_court_visible(frame: np.ndarray) -> bool:
 
 
 def build_court_roi(frame_w: int, frame_h: int) -> np.ndarray:
+    """Hardcoded fallback ROI — used when auto-detection fails."""
     pts = np.array([
         [frame_w * 0.13, frame_h * 0.88],
         [frame_w * 0.87, frame_h * 0.88],
@@ -1075,6 +1179,77 @@ def build_court_roi(frame_w: int, frame_h: int) -> np.ndarray:
         [frame_w * 0.25, frame_h * 0.19],
     ], dtype=np.float32)
     return pts.reshape((-1, 1, 2)).astype(np.int32)
+
+
+def detect_court_roi(cap: cv2.VideoCapture, n_frames: int = 30,
+                     frame_w: int = 0, frame_h: int = 0) -> np.ndarray:
+    """Auto-detect court ROI from the first N frames using wood floor color.
+
+    Accumulates wood-color masks, finds the largest contour, and returns
+    a convex hull polygon. Falls back to hardcoded ROI on failure.
+    Rewinds the capture to frame 0 when done.
+    """
+    orig_pos = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    w = frame_w or int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = frame_h or int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    accum = np.zeros((h, w), dtype=np.float32)
+    count = 0
+
+    for _ in range(n_frames):
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if frame.shape[1] != w or frame.shape[0] != h:
+            frame = cv2.resize(frame, (w, h))
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        # Detect multiple court surface colors:
+        # - Wood floor (tan/brown): H=10-30, S=30-180, V=120-240
+        # - Blue paint (keys/sidelines): H=90-130, S=40-255, V=80-240
+        # - Red/orange paint: H=0-10 or 160-180, S=50-255, V=80-240
+        # - Gray/white paint (lines): H=0-180, S=0-40, V=160-255
+        wood   = cv2.inRange(hsv, (10, 30, 120), (30, 180, 240))
+        blue   = cv2.inRange(hsv, (90, 40, 80), (130, 255, 240))
+        red_lo = cv2.inRange(hsv, (0, 50, 80), (10, 255, 240))
+        red_hi = cv2.inRange(hsv, (160, 50, 80), (180, 255, 240))
+        white  = cv2.inRange(hsv, (0, 0, 160), (180, 40, 255))
+        court_mask = wood | blue | red_lo | red_hi | white
+        # Exclude very dark regions (crowd/stands tend to be darker)
+        accum += (court_mask > 0).astype(np.float32)
+        count += 1
+
+    cap.set(cv2.CAP_PROP_POS_FRAMES, orig_pos)
+
+    if count == 0:
+        print("[court ROI] No frames read, using hardcoded fallback")
+        return build_court_roi(w, h)
+
+    # Threshold: pixel is "court" if detected as wood in >40% of sampled frames
+    avg = accum / count
+    binary = (avg > 0.4).astype(np.uint8) * 255
+
+    # Clean up noise
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        print("[court ROI] No court contour found, using hardcoded fallback")
+        return build_court_roi(w, h)
+
+    largest = max(contours, key=cv2.contourArea)
+    min_area = w * h * 0.10  # court should be at least 10% of frame
+    if cv2.contourArea(largest) < min_area:
+        print("[court ROI] Court contour too small, using hardcoded fallback")
+        return build_court_roi(w, h)
+
+    hull = cv2.convexHull(largest)
+    print(f"[court ROI] Auto-detected from {count} frames "
+          f"({len(hull)} hull points, area={cv2.contourArea(hull):.0f}px)")
+    return hull
 
 
 def in_court_roi(roi_poly: np.ndarray, box: list) -> bool:
@@ -1085,41 +1260,33 @@ def in_court_roi(roi_poly: np.ndarray, box: list) -> bool:
 
 def ball_in_court_region(roi_poly: np.ndarray, cx: float, cy: float,
                          frame_w: int) -> bool:
-    """Check if ball is within the court or above it (airborne).
-
-    Rules:
-      - Ball BELOW the court bottom edge → reject (crowd/bench area)
-      - Ball WITHIN or ABOVE the court → accept if x is within court column
-      - Small vertical slack below bottom edge for balls near the baseline
-
-    The court ROI trapezoid has 4 points:
-      [0] bottom-left, [1] bottom-right, [2] top-right, [3] top-left
     """
-    pts = roi_poly.reshape(-1, 2).astype(np.float64)
-    bl, br, tr, tl = pts[0], pts[1], pts[2], pts[3]
+    Check if ball is within the horizontal 'box' of the court.
+    Ignores height (y) to allow for high-arcing 3-pointers.
+    """
+    if roi_poly is None or len(roi_poly) < 3:
+        return True
 
-    top_y = min(tl[1], tr[1])
-    bot_y = max(bl[1], br[1])
+    pts = roi_poly.reshape(-1, 2)
+    
+    # 1. Get the absolute widest points of the court in the frame
+    min_x = np.min(pts[:, 0])
+    max_x = np.max(pts[:, 0])
+    
+    # 2. Get the very bottom of the court to filter out the crowd/floor below
+    bot_y = np.max(pts[:, 1])
+
+    # 3. Apply padding
     pad_x = frame_w * BALL_COURT_X_PAD
-    # Small vertical slack below the baseline (ball can bounce near edge)
-    pad_y = (bot_y - top_y) * 0.05
-
-    # Reject anything below the court bottom + slack (crowd/bench)
+    pad_y = 50  # pixels of slack below the court
+    
+    # REJECT if it's below the floor (shoes/referee feet/floor reflections)
     if cy > bot_y + pad_y:
         return False
 
-    # For ball within or above the court, check x is in the court column
-    if cy <= top_y:
-        # Above the court — use top edge x-span
-        left_x  = tl[0] - pad_x
-        right_x = tr[0] + pad_x
-    else:
-        # Within the court trapezoid — interpolate left/right edges
-        t = (cy - top_y) / (bot_y - top_y)
-        left_x  = tl[0] + t * (bl[0] - tl[0]) - pad_x
-        right_x = tr[0] + t * (br[0] - tr[0]) + pad_x
-
-    return left_x <= cx <= right_x
+    # ACCEPT if it is within the horizontal span, no matter how high it is
+    # This ensures high arcs are never clipped by perspective tapering
+    return (min_x - pad_x) <= cx <= (max_x + pad_x)
 
 
 # ---------------------------------------------------------------------------
@@ -1472,7 +1639,8 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
             ball_radius=TRACKNET_BALL_RADIUS,
         )
 
-    roi_poly      = build_court_roi(frame_w, frame_h)
+    roi_poly      = detect_court_roi(cap, n_frames=30,
+                                      frame_w=frame_w, frame_h=frame_h)
     ghost_max_age = int(fps * 0.5)   # 0.5s — was 1.5s, caused stale boxes in empty space
     memory        = TrackMemory(max_age=ghost_max_age)
     reid_buffer   = TemporalReIDBuffer()
