@@ -298,14 +298,17 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
     TP: model predicts ball AND predicted center ≤ pe_thresh px from GT.
     FP: model predicts ball but no GT, or distance > pe_thresh.
     FN: model predicts no ball but GT exists.
+
+    Also tracks per-game TP/FP/FN for diagnostic breakdowns.
     """
     tp = fp = fn = 0
     total_loss = 0.0
     margins = []                      # peak - highest-distractor on visible frames
+    game_stats: dict[str, dict] = {}  # {game: {tp, fp, fn}}
     model.eval()
     use_amp = device != "cpu"
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
-        for inp, target, vis_flags in loader:
+        for inp, target, vis_flags, games in loader:
             inp    = inp.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
             out    = model(inp)          # (B, 1, H, W) logits
@@ -314,6 +317,9 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
             target_np = target.cpu().numpy()
             vis_np    = vis_flags.cpu().numpy()
             for b in range(pred_np.shape[0]):
+                game = games[b]
+                if game not in game_stats:
+                    game_stats[game] = {"tp": 0, "fp": 0, "fn": 0}
                 has_ball = int(vis_np[b]) > 0
                 gt_hmap  = target_np[b, 0]
                 if has_ball:
@@ -325,12 +331,7 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
                 pred_detect = pred_conf >= conf_thresh
                 pr_y, pr_x  = divmod(int(pred_hmap.argmax()), INPUT_W)
 
-                # Peak-to-distractor margin: on visible frames, mask a 21x21
-                # window around the primary peak and take the next-highest
-                # pixel as the "distractor". A large margin means the model
-                # confidently separates the ball from all background features;
-                # shrinking margin is a leading indicator of robustness decay
-                # that F1 alone can't see.
+                # Peak-to-distractor margin
                 if has_ball:
                     y0 = max(0, pr_y - 10)
                     y1 = min(INPUT_H, pr_y + 11)
@@ -345,28 +346,44 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
                     dist = math.hypot(pr_x - gt_x, pr_y - gt_y)
                     if dist <= pe_thresh:
                         tp += 1
+                        game_stats[game]["tp"] += 1
                     else:
                         fp += 1
                         fn += 1
+                        game_stats[game]["fp"] += 1
+                        game_stats[game]["fn"] += 1
                 elif pred_detect:
                     fp += 1
+                    game_stats[game]["fp"] += 1
                 elif has_ball:
                     fn += 1
+                    game_stats[game]["fn"] += 1
     avg_loss   = total_loss / max(len(loader), 1)
     avg_margin = sum(margins) / max(len(margins), 1) if margins else 0.0
     prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+
+    # Per-game F1
+    per_game = {}
+    for g, s in sorted(game_stats.items()):
+        g_prec = s["tp"] / (s["tp"] + s["fp"]) if (s["tp"] + s["fp"]) > 0 else 0.0
+        g_rec  = s["tp"] / (s["tp"] + s["fn"]) if (s["tp"] + s["fn"]) > 0 else 0.0
+        g_f1   = 2 * g_prec * g_rec / (g_prec + g_rec) if (g_prec + g_rec) > 0 else 0.0
+        per_game[g] = {"precision": g_prec, "recall": g_rec, "f1": g_f1,
+                       "tp": s["tp"], "fp": s["fp"], "fn": s["fn"]}
+
     return {"val_loss": avg_loss, "precision": prec, "recall": rec,
             "f1": f1, "margin": avg_margin,
-            "tp": tp, "fp": fp, "fn": fn}
+            "tp": tp, "fp": fp, "fn": fn,
+            "per_game": per_game}
 
 
 def _wandb_prediction_samples(model, val_loader, device, n_samples=8):
     """Generate W&B image table with GT vs predicted heatmap overlays."""
     model.eval()
     images = []
-    inp, target, _vis = next(iter(val_loader))
+    inp, target, _vis, _game = next(iter(val_loader))
     inp = inp.to(device)
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=(device != "cpu")):
         pred = torch.sigmoid(model(inp)).cpu().numpy()
@@ -566,15 +583,18 @@ class TrackNetDataset(Dataset):
         inp = np.concatenate([f0, f1, f2, diff01, diff12], axis=0)   # (11, H, W)
 
         if cx >= 0 and cy >= 0 and vis2 > 0:
-            hmap = generate_heatmap(int(cx), int(cy), INPUT_W, INPUT_H,
+            hmap = generate_heatmap(round(cx), round(cy), INPUT_W, INPUT_H,
                                     self.sigma)
         else:
             hmap = np.zeros((INPUT_H, INPUT_W), dtype=np.float32)
         hmap = hmap[np.newaxis, :, :]   # (1, H, W)
 
+        game = Path(path2).parent.name
+
         return (torch.from_numpy(inp),
                 torch.from_numpy(hmap),
-                torch.tensor(1 if (vis2 > 0 and cx >= 0) else 0))
+                torch.tensor(1 if (vis2 > 0 and cx >= 0) else 0),
+                game)
 
 
 # ---------------------------------------------------------------------------
@@ -587,7 +607,8 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                    num_workers: int = 4,
                    resume: bool = False,
                    accum_steps: int = 2,
-                   data_root: str | None = None):
+                   data_root: str | None = None,
+                   seed: int = 42):
     """Train TrackNetV3 on basketball frame sequences.
 
     Args:
@@ -595,7 +616,15 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                      batch_size * accum_steps (default 8*2=16).
         data_root: root directory for frame data. When set, CSV paths like
                    'data\\...' are remapped to data_root/... for fast local I/O.
+        seed: random seed for reproducibility.
     """
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    pyrandom.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    print(f"Random seed: {seed}")
+
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
@@ -603,7 +632,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
     val_csv   = str(Path(data_dir) / "val.csv")
 
     print("Building training dataset ...")
-    train_ds = TrackNetDataset(train_csv, oversample_visible=True, augment=True,
+    train_ds = TrackNetDataset(train_csv, oversample_visible=False, augment=True,
                                data_root=data_root)
     val_ds   = (TrackNetDataset(val_csv, augment=False, data_root=data_root)
                 if Path(val_csv).exists() else None)
@@ -644,7 +673,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4,
                                   weight_decay=5e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=40, eta_min=1e-6)
+        optimizer, T_max=max(epochs // 2, 10), eta_min=1e-6)
 
     use_amp = device != "cpu"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -722,7 +751,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
         train_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
 
-        for batch_idx, (inp, target, _vis) in enumerate(train_loader):
+        for batch_idx, (inp, target, _vis, _game) in enumerate(train_loader):
             inp    = inp.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
 
@@ -759,6 +788,9 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                   f"prec={pe['precision']:.3f}  rec={pe['recall']:.3f}  "
                   f"F1={pe['f1']:.3f}  margin={pe['margin']:.3f}  "
                   f"(TP={pe['tp']} FP={pe['fp']} FN={pe['fn']})")
+            for g, gs in pe.get("per_game", {}).items():
+                print(f"  {g}: prec={gs['precision']:.3f} rec={gs['recall']:.3f} "
+                      f"F1={gs['f1']:.3f} (TP={gs['tp']} FP={gs['fp']} FN={gs['fn']})")
             if _HAS_WANDB:
                 log_dict = {
                     "epoch": epoch + 1,
@@ -773,6 +805,10 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                     "val/fn": pe["fn"],
                     "lr": scheduler.get_last_lr()[0],
                 }
+                for g, gs in pe.get("per_game", {}).items():
+                    log_dict[f"val/{g}/f1"] = gs["f1"]
+                    log_dict[f"val/{g}/precision"] = gs["precision"]
+                    log_dict[f"val/{g}/recall"] = gs["recall"]
                 if (epoch + 1) % 5 == 0:
                     try:
                         log_dict["predictions"] = _wandb_prediction_samples(
@@ -1029,6 +1065,8 @@ if __name__ == "__main__":
                         help="DataLoader num_workers (default 4)")
     parser.add_argument("--resume", action="store_true",
                         help="Resume training from last_ckpt.pt checkpoint")
+    parser.add_argument("--seed", type=int, default=6050,
+                        help="Random seed for reproducibility (default 6050)")
     args = parser.parse_args()
 
     if args.preprocess:
@@ -1038,6 +1076,7 @@ if __name__ == "__main__":
                        device=args.device,
                        num_workers=args.workers, resume=args.resume,
                        accum_steps=args.accum,
-                       data_root=args.data_root)
+                       data_root=args.data_root,
+                       seed=args.seed)
     else:
         print("Use --train or --preprocess. See --help for options.")

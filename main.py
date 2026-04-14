@@ -91,6 +91,12 @@ BALL_TEMPORAL_RADIUS = 80      # max px spread to count as "same region" (at 108
 BALL_INTERP_BUFFER   = 20      # frames to buffer for look-ahead (~333ms at 60fps)
 BALL_INTERP_MAX_GAP  = 8       # max consecutive missing frames to interpolate
 
+# Ball head-lock rejection — use pose keypoints to reject bald-head false positives
+BALL_HEADLOCK_WINDOW   = 20    # frames of offset history to evaluate (~333ms at 60fps)
+BALL_HEADLOCK_MAX_VAR  = 6.0   # max px std-dev of offset to count as "locked" to a head
+BALL_HEADLOCK_HEAD_KPS = (0, 1, 2, 3, 4)  # COCO: nose, left_eye, right_eye, left_ear, right_ear
+BALL_HEADLOCK_PROX     = 80    # px — ball must be this close to a head kp to start tracking offset
+
 # Court visibility detection
 COURT_MIN_LINES      = 4       # min Hough lines to consider court visible
 COURT_WOOD_RATIO     = 0.15    # min ratio of wood-colored pixels (tan/brown floor)
@@ -817,11 +823,88 @@ class BallInterpolator:
 
 
 # ---------------------------------------------------------------------------
+# Head-Lock Detector — reject detections fused to a player's skull
+# ---------------------------------------------------------------------------
+
+class HeadLockDetector:
+    """Track whether a ball candidate is rigidly attached to a head keypoint.
+
+    For each player, we record the offset (dx, dy) from their nearest head
+    keypoint to the ball center every frame.  If that offset stays nearly
+    constant (std-dev < threshold) over BALL_HEADLOCK_WINDOW frames, the
+    "ball" is really a part of the player's body (e.g. bald head).
+
+    A real ball near a head — during a shot, pass, or catch — always has
+    independent motion so the offset drifts, breaking the lock.
+    """
+
+    def __init__(self, frame_w: int):
+        self._scale = frame_w / 1920.0
+        self._prox = BALL_HEADLOCK_PROX * self._scale
+        self._max_var = BALL_HEADLOCK_MAX_VAR * self._scale
+        # Per-player offset history: tid → deque of (dx, dy)
+        self._offsets: dict[int, deque] = {}
+
+    def is_head_locked(self, bcx: float, bcy: float,
+                       pose_map: dict) -> bool:
+        """Return True if (bcx, bcy) appears fused to any player's head."""
+        active_tids = set()
+
+        for tid, (kps_xy, kps_conf) in pose_map.items():
+            # Find the nearest high-confidence head keypoint
+            best_dist = self._prox
+            best_kp = None
+            for kp_idx in BALL_HEADLOCK_HEAD_KPS:
+                if kps_conf[kp_idx] < KP_CONF_THRESH:
+                    continue
+                kx, ky = float(kps_xy[kp_idx][0]), float(kps_xy[kp_idx][1])
+                if kx == 0.0 and ky == 0.0:
+                    continue  # undetected keypoint
+                dist = math.hypot(bcx - kx, bcy - ky)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_kp = (kx, ky)
+
+            if best_kp is None:
+                # Ball not near this player's head — clear their history
+                self._offsets.pop(tid, None)
+                continue
+
+            active_tids.add(tid)
+            dx = bcx - best_kp[0]
+            dy = bcy - best_kp[1]
+
+            if tid not in self._offsets:
+                self._offsets[tid] = deque(maxlen=BALL_HEADLOCK_WINDOW)
+            self._offsets[tid].append((dx, dy))
+
+            buf = self._offsets[tid]
+            if len(buf) >= BALL_HEADLOCK_WINDOW:
+                dxs = [o[0] for o in buf]
+                dys = [o[1] for o in buf]
+                std = math.hypot(np.std(dxs), np.std(dys))
+                if std < self._max_var:
+                    return True
+
+        # Prune players no longer relevant
+        for tid in list(self._offsets.keys()):
+            if tid not in active_tids:
+                del self._offsets[tid]
+
+        return False
+
+    def clear(self):
+        """Reset all offset histories (e.g. on track loss)."""
+        self._offsets.clear()
+
+
+# ---------------------------------------------------------------------------
 # Ball Validator — reject false positives (off-court, teleports, backboard)
 # ---------------------------------------------------------------------------
 
 class BallValidator:
-    """Validate ball detections: court boundary, teleport rejection, backboard."""
+    """Validate ball detections: court boundary, teleport rejection, backboard,
+    and head-lock rejection via pose keypoints."""
 
     def __init__(self, roi_poly: np.ndarray, frame_w: int, frame_h: int):
         self._roi_poly = roi_poly
@@ -834,9 +917,10 @@ class BallValidator:
         self._max_teleport = BALL_MAX_TELEPORT_PX * (frame_w / 1920.0)
         self._temporal_radius = BALL_TEMPORAL_RADIUS * (frame_w / 1920.0)
         self._recent_candidates: deque = deque(maxlen=BALL_TEMPORAL_WINDOW)
+        self._headlock = HeadLockDetector(frame_w)
 
     def filter(self, frame_idx: int, ball_dets: list,
-               hoop_dets: list) -> list:
+               hoop_dets: list, pose_map: dict | None = None) -> list:
         """Return only plausible ball detections."""
         valid = []
         for d in ball_dets:
@@ -911,6 +995,18 @@ class BallValidator:
                 if nearby < BALL_TEMPORAL_MIN:
                     return []
 
+            # --- Check 5: Head-lock rejection ---
+            # If the ball candidate has been rigidly tracking a player's
+            # head keypoints (near-zero relative motion) for 20+ frames,
+            # it's a bald head, not a ball.  Clears tracker state on reject
+            # so the real ball can re-acquire without fighting temporal gates.
+            if pose_map and self._headlock.is_head_locked(bcx, bcy, pose_map):
+                self._headlock.clear()
+                self._last_center = None
+                self._last_frame = -999
+                self._recent_candidates.clear()
+                return []
+
             self._last_center = (bcx, bcy)
             self._last_frame = frame_idx
             for h in hoop_dets:
@@ -920,6 +1016,9 @@ class BallValidator:
                     break
             return [best_det]
 
+        # No ball detected this frame — still feed the headlock detector
+        # a "miss" so offset histories don't stale (they'll be pruned
+        # naturally since no tid will match next frame).
         return []
 
     def _near_any_hoop(self, cx: float, cy: float, hoop_dets: list) -> bool:
@@ -1442,7 +1541,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                 draw_player(frame, d["box"], label, color=team_color)
 
             skip_ball = tracknet_ball_box if tracknet_ball_box else last_ball_box
-            skip_label = "BALL (TrackNet)" if tracknet_ball_box else None
+            skip_label = "BALL" if tracknet_ball_box else None
             ball_interp.push(frame, skip_ball, skip_label)
             for fin_frame, fin_ball_box, fin_label in ball_interp.pop_ready():
                 if fin_ball_box is not None:
@@ -1537,7 +1636,8 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         pose_map = cached_pose_map
 
         # ---- 5. Ball validation + tracking ------------------------------------
-        ball_dets    = ball_validator.filter(frame_idx, ball_dets, hoop_dets)
+        ball_dets    = ball_validator.filter(frame_idx, ball_dets, hoop_dets,
+                                            pose_map=pose_map)
         ball_to_draw = ball_tracker.update(frame_idx, ball_dets)
 
         # ---- 6. Draw hoop / ref / players (everything except ball) ------------

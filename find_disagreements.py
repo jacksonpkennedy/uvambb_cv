@@ -486,7 +486,7 @@ Remove-Item output\disagreements\position_mismatch\game_* -Force
       data/tracknet_merged/backups/<YYYYMMDD_HHMMSS>_zero_neither/
 
 6) RETRAIN
-   python tracknet.py --train --epochs 100 --batch 8
+   python tracknet.py --train --epochs 40 --batch 8
 
    The .npy preprocessing cache does NOT need regeneration — it stores
    resized frames, not labels. Label changes take effect next epoch.
