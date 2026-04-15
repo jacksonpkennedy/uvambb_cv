@@ -20,6 +20,8 @@ Output:
 import csv
 from pathlib import Path
 
+import fix_log
+
 SOURCES = [
     "data/tracknet_labels/train.csv",
     "data/tracknet_labels/val.csv",
@@ -85,6 +87,22 @@ def main():
         val_rows.extend(v_rows)
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Replay fix log BEFORE writing the final CSVs. This applies every
+    # correction previously made via apply_fixes.py / zero_neither_correct.py
+    # (removes, repositions, adds, zeros) so a re-merge doesn't wipe out
+    # prior cleaning iterations.
+    entries = fix_log.read_entries(OUTPUT_DIR)
+    if entries:
+        print(f"\nReplaying {len(entries)} fix-log entries…")
+        train_stats = fix_log.apply_to_rows(train_rows, entries)
+        val_stats   = fix_log.apply_to_rows(val_rows,   entries)
+        combined = {k: train_stats.get(k, 0) + val_stats.get(k, 0)
+                    for k in ("remove", "reposition", "add", "zero", "missing")}
+        print(f"  remove={combined['remove']}, reposition={combined['reposition']}, "
+              f"add={combined['add']}, zero={combined['zero']}, "
+              f"missing={combined['missing']} (rows no longer in merged set)")
+
     for split, rows in [("train", train_rows), ("val", val_rows)]:
         out_path = OUTPUT_DIR / f"{split}.csv"
         with open(out_path, "w", newline="") as f:

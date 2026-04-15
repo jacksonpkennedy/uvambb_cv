@@ -32,6 +32,7 @@ import csv
 from pathlib import Path
 
 from csv_backup import backup_csvs
+import fix_log
 
 
 def collect_from_dir(neither_dir: Path) -> set[tuple[str, str]]:
@@ -135,6 +136,14 @@ def main():
         total_zeroed += stats["zeroed"]
         print(f"{split}: zeroed {stats['zeroed']}, "
               f"already zero {stats['already_zero']} / {stats['total']} rows")
+
+    # Persist so merge_labels.py can replay these zero-outs on re-merge.
+    # We log every target (not just rows we found) because a future merge
+    # may re-introduce the frame with a non-zero label that we'd need to
+    # zero out again.
+    fix_log.append(args.data, [
+        {"game": g, "stem": s, "action": "zero"} for g, s in targets
+    ])
 
     print(f"\nTotal zeroed: {total_zeroed}")
     print("Next: retrain with  python tracknet.py --train --epochs 100 --batch 8")

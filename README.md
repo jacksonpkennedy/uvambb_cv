@@ -146,10 +146,12 @@ uvambb_cv/
 │   │   └── valid/                   # 97 validation images + labels (80/20 split)
 │   │       ├── images/
 │   │       └── labels/
-│   ├── tracknet_merged/             # Merged training data from all games (~28K frames)
+│   ├── tracknet_merged/             # Merged training data from all games (~38K frames)
 │   │   ├── train.csv                # Training labels (85% per game)
-│   │   └── val.csv                  # Validation labels (last 15% per game)
+│   │   ├── val.csv                  # Validation labels (last 15% per game)
+│   │   └── backups/                 # Timestamped CSV snapshots (auto-created before each mutation)
 │   ├── tracknet_autolabels/         # Auto-labeled frames (game_01)
+│   ├── tracknet_autolabels_01b/     # Second auto-label pass on game_01 (expanded frame set)
 │   ├── tracknet_autolabels_02/      # Auto-labeled frames (game_02)
 │   ├── tracknet_autolabels_03/      # Auto-labeled frames (game_03)
 │   ├── tracknet_labels/             # Converted YOLO → TrackNet labels (from Roboflow data)
@@ -274,7 +276,7 @@ Aggressive color augmentation to force shape-based learning over color shortcuts
 | Target | 2D Gaussian heatmap (sigma=3.16 = sqrt(10)) | Ball center as soft probability map, per TrackNetV1 paper |
 | Loss | CenterNet focal loss (Zhou et al. 2019) | Adaptive weighting for extreme class imbalance — pos normalized by num_pos, neg normalized by num_total |
 | Optimizer | AdamW (lr=1e-4, weight_decay=1e-4) | Decoupled weight decay (Loshchilov & Hutter 2019) |
-| Scheduler | CosineAnnealingLR (eta_min=1e-6) | Smooth LR decay, crash-safe (only decreases) |
+| Scheduler | CosineAnnealingLR (T_max=max(epochs/2, 10), eta_min=1e-6) | Dynamic T_max matches expected training duration so LR actually reaches the low-LR phase within the early-stopping window |
 | Gradient accumulation | batch=8 x accum=2 = effective 16 | Larger effective batch without extra VRAM |
 | Mixed precision | AMP fp16 (autocast + GradScaler) | ~2x throughput on RTX 4070 |
 | Early stopping | Patience 15 on val F1 | Stops when PE F1 metric plateaus |
@@ -282,8 +284,10 @@ Aggressive color augmentation to force shape-based learning over color shortcuts
 | Augmentation | Horizontal flip, brightness jitter, Gaussian noise (per-frame), motion blur (30%) | Data variety without distorting ball position |
 | Oversampling | Visible sequences repeated to match empty count | Addresses ~60% empty frames in training data |
 | Inference TTA | Horizontal flip + average | Eliminates left/right asymmetry, ~1-3% precision gain |
-| Evaluation metric | PE (Positioning Error) at 5px threshold | Precision, recall, F1 computed on predicted vs GT ball center distance |
-| Training data | ~28K frames from 3 games (merged) | Auto-labeled with YOLO+SAHI, per-game last-15% val split |
+| Evaluation metric | PE (Positioning Error) at 5px threshold | Precision, recall, F1 computed on predicted vs GT ball center distance, reported both aggregate and **per-game** (`val/{game}/f1`) to isolate which game drags the score |
+| Heatmap target | 2D Gaussian centered on `round(cx, cy)` | Uses `round()` not `int()` — previous int-truncation introduced systematic 0-0.5px bias |
+| Reproducibility | Seeds (`--seed 42` default) | `torch.manual_seed`, `np.random.seed`, `random.seed`, `torch.cuda.manual_seed_all` all set at start of `train_tracknet()` so config changes can be compared reliably |
+| Training data | ~38K frames from 3 games (merged) | Auto-labeled with YOLO+SAHI, per-game last-15% val split. game_01 has two label sources (original + `_01b` re-extraction) |
 | Frame cache | .npy binary (pre-resized 640x360) | ~5x faster than JPEG decode, critical on Windows |
 | Checkpoint | Full state (model + optimizer + scheduler + scaler + best_f1) | Crash-safe resume with `--resume` |
 
@@ -342,16 +346,30 @@ YOLO sees one frame at a time — the ball is ~15-25px with motion blur, often i
 3. **Fallback** — raw peak pixel location if centroid computation fails
 
 ### Validation (BallValidator)
-Rejects false positives with 3 checks:
-1. **Court region** — ball must be within court column bounds (with 5% horizontal padding), below court bottom rejected
-2. **Teleport rejection** — max 450px/frame movement (scaled to resolution), with grace period reset after 10 frames unseen
-3. **Backboard constraint** — if ball was near hoop recently, reject detections above and behind the hoop (crowd area)
+Rejects false positives with 5 checks (in order):
+
+1. **Court region** — ball must be within the court polygon column (with 5% horizontal padding at a given y-level); anything below the court bottom + slack rejected. Works with arbitrary convex polygon shape (walks polygon edges to find x-intercepts at the ball's y-level).
+2. **Velocity-aware teleport** — allowed per-frame motion is `max(120px, current_speed × 2.5) × frame_gap` at 1080p, scaled to resolution. This grows with the ball's recent velocity so fast passes and shots aren't rejected. A 5-frame velocity history smooths the threshold.
+3. **Cold-start pathway** — when velocity history is near-zero (held ball, dead ball, just-acquired track), the base threshold can't justify a legitimate pass/shot start. A cold-start check allows a one-off jump up to 350px. Subsequent frames rely on the teleport check and head-lock detector to reject false positives that don't continue in a coherent direction.
+4. **Backboard constraint** — if ball was near a hoop within the last 30 frames, reject detections above the hoop and on the outside horizontal half (crowd/backboard supports).
+5. **Temporal consistency (on re-acquisition only)** — after a gap beyond the teleport grace window, require 3 of 5 recent candidates to cluster within 120px before accepting the new detection. Active tracks bypass this (no delay during continuous tracking).
+6. **Head-lock rejection** — `HeadLockDetector` tracks the offset between the ball candidate and the nearest high-confidence head keypoint per player over 20 frames. If the combined x/y std-dev stays below 6px (scaled), the candidate is rigidly fused to a skull rather than a ball; rejected, and tracker state cleared so the real ball can re-acquire.
+
+### Auto Court ROI Detection
+`detect_court_roi` samples the first 30 frames and accumulates a multi-color court mask in HSV:
+- Wood floor (tan/brown): H=10–30, S=30–180, V=120–240
+- Blue paint (keys/sidelines): H=90–130
+- Red paint: H=0–10 and 160–180
+- White paint/lines: S<40, V>160
+
+Pixels classed as court in >40% of sampled frames form a binary mask, morphologically cleaned, then the largest contour's convex hull is used as the ROI. If the contour is smaller than 10% of the frame, falls back to the hardcoded trapezoid. Supports painted/muraled courts with non-wood surfaces.
 
 ### Tracking (BallTracker) with Kalman Filter
-- Picks highest-confidence detection per frame
+- Picks highest-confidence detection per frame (teleport filtering already handled upstream by BallValidator — no redundant gating here)
 - **Kalman filter** (4-state constant-velocity model: x, y, vx, vy) smooths frame-to-frame jitter
-  - Measurement noise R=15, process noise Q=0.5
-  - Auto-resets on teleport-size jumps to avoid filter divergence
+  - Measurement noise R=15
+  - Process noise Q=`diag([0.5, 0.5, 4.0, 4.0])` — low on position (measurements are accurate), 8× higher on velocity components so the filter trusts measurements during acceleration (shots, bounces, passes)
+  - **Velocity-aware reset threshold** — filter resets when measurement is more than `max(120, kf_speed × 2.5)` px from prediction. Fixed thresholds caused spurious resets during legitimate acceleration.
   - Smoothed box rebuilt around filtered center
 - 5-frame velocity history (uses raw centers to avoid Kalman feedback loop)
 
@@ -362,6 +380,12 @@ Post-game look-ahead analysis with 20-frame sliding buffer:
 - Compare spike's jump distance to the neighbor-to-neighbor distance (how far the real ball moved)
 - If the spike jumps 3x+ further than the neighbors moved apart (+ 20px margin), it's a false positive
 - This catches nearby false positives (shirts, shoes 50-80px away) that absolute thresholds miss
+- Runs in 3 passes for 1-, 2-, and 3-frame spikes (catches longer coherent false-positive runs)
+
+**Endpoint Stability Gate** — before interpolating, both endpoints must pass a stability check:
+- Majority-vote test: at least `MIN_STABLE` (2) of the last `STABLE_WINDOW` (8) frames around the endpoint must have detections clustering within `STABLE_RADIUS` (180px at 1080p) of the endpoint
+- Gaps in detection are allowed — this tolerates the current F1 (~44%) without blocking interpolation entirely
+- Prevents interpolating between a real ball and a transient head-lock false positive, which would draw an artifact path from the ball to the head
 
 **Gap Filling** — interpolates up to 8 consecutive missing frames:
 - Linear interpolation for short gaps (<=3 frames)
@@ -527,12 +551,13 @@ Two-tier matching when players reappear after going off-camera:
 
 ## Known Limitations
 
-- Ball tracking degrades during fast passes and heavy occlusion
+- Ball tracking can still drop during long occlusions (>8 frames) — beyond the interpolation max gap
 - Jersey OCR accuracy depends on camera resolution and player orientation
-- Court ROI polygon is hardcoded — needs adjustment for different camera angles
+- Auto-detected court ROI depends on visible court surface; falls back to hardcoded trapezoid when detection fails (e.g., extreme zoom, unusual lighting)
 - Pose estimation can occasionally snap to nearby referees despite filtering
 - Team classification assumes two distinct jersey colors — may struggle with similar uniforms
-- Auto-labeled training data has inherent noise (~20% error rate before cleaning)
+- Auto-labeled training data has inherent noise (~20% error rate before cleaning) — iterative audit loop addresses this but is hand-reviewed per iteration
+- TrackNet F1 is currently class-imbalanced — `game_02` has 7% visible frames in train vs. 52% in val, dragging aggregate F1. Per-game F1 logging exposes this; stratified split is a planned future fix
 
 ---
 
@@ -541,6 +566,8 @@ Two-tier matching when players reappear after going off-camera:
 - Jackson Kennedy
 - Nathan Wan
 - Nathan Todd
+- Hudson Noyes
+- James Sweat
 
 ---
 

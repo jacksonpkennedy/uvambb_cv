@@ -32,6 +32,7 @@ import re
 from pathlib import Path
 
 from csv_backup import backup_csvs
+import fix_log
 
 try:
     import wandb
@@ -108,7 +109,9 @@ def patch_csv(csv_path: str,
               min_dist: float, min_conf: float,
               max_fp_frame: int | None,
               max_pm_frame: int | None,
-              max_fn_frame: int | None) -> dict:
+              max_fn_frame: int | None) -> tuple[dict, list[dict]]:
+    """Patch a CSV in place and return (stats, log_entries). Log entries
+    record every action so merge_labels.py can replay them later."""
     rows = []
     with open(csv_path) as f:
         for row in csv.DictReader(f):
@@ -120,10 +123,11 @@ def patch_csv(csv_path: str,
     skipped_fp = 0
     skipped_pm = 0
     skipped_fn = 0
+    log_entries: list[dict] = []
 
     for row in rows:
         k = _key(row["frame_path"])
-        stem = k[1]
+        game, stem = k
 
         # 1) Remove false positives (bad labels)
         if k in fp_set and int(row["visibility"]) > 0:
@@ -132,6 +136,7 @@ def patch_csv(csv_path: str,
                 row["x"] = "-1"
                 row["y"] = "-1"
                 removed += 1
+                log_entries.append({"game": game, "stem": stem, "action": "remove"})
                 continue
             else:
                 skipped_fp += 1
@@ -144,6 +149,12 @@ def patch_csv(csv_path: str,
                     row["x"] = f"{fix['pred_x']:.1f}"
                     row["y"] = f"{fix['pred_y']:.1f}"
                     repositioned += 1
+                    log_entries.append({
+                        "game": game, "stem": stem, "action": "reposition",
+                        "visibility": 1,
+                        "x": f"{fix['pred_x']:.1f}",
+                        "y": f"{fix['pred_y']:.1f}",
+                    })
                     continue
                 else:
                     skipped_pm += 1
@@ -157,6 +168,12 @@ def patch_csv(csv_path: str,
                     row["x"] = f"{m['pred_x']:.1f}"
                     row["y"] = f"{m['pred_y']:.1f}"
                     added += 1
+                    log_entries.append({
+                        "game": game, "stem": stem, "action": "add",
+                        "visibility": 1,
+                        "x": f"{m['pred_x']:.1f}",
+                        "y": f"{m['pred_y']:.1f}",
+                    })
                 else:
                     skipped_fn += 1
 
@@ -165,9 +182,10 @@ def patch_csv(csv_path: str,
         writer.writeheader()
         writer.writerows(rows)
 
-    return {"removed": removed, "repositioned": repositioned, "added": added,
-            "skipped_fp": skipped_fp, "skipped_pm": skipped_pm,
-            "skipped_fn": skipped_fn, "total": len(rows)}
+    stats = {"removed": removed, "repositioned": repositioned, "added": added,
+             "skipped_fp": skipped_fp, "skipped_pm": skipped_pm,
+             "skipped_fn": skipped_fn, "total": len(rows)}
+    return stats, log_entries
 
 
 def main():
@@ -223,10 +241,14 @@ def main():
               + (f" (adding conf >= {args.min_conf:.2f})" if args.add_missed else " (skipping)")
               + (f" [cutoff <= {args.max_fn_frame}]" if args.max_fn_frame else ""))
 
-        stats = patch_csv(str(csv_path), fp_set, pos_fixes, missed,
-                          args.fix_positions, args.add_missed,
-                          args.min_dist, args.min_conf,
-                          args.max_fp_frame, args.max_pm_frame, args.max_fn_frame)
+        stats, log_entries = patch_csv(
+            str(csv_path), fp_set, pos_fixes, missed,
+            args.fix_positions, args.add_missed,
+            args.min_dist, args.min_conf,
+            args.max_fp_frame, args.max_pm_frame, args.max_fn_frame)
+
+        # Persist log so a future re-merge replays these corrections
+        fix_log.append(args.data, log_entries)
 
         for k in total:
             total[k] += stats[k]

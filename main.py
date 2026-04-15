@@ -805,61 +805,190 @@ class BallInterpolator:
                 count += 1
         return count >= self.MIN_STABLE
 
-    def _fill_gaps(self):
-        """Reject outlier spikes, then fill gaps with interpolated positions.
+    def _reject_physics_outliers(self):
+        """Reject detections that break the ball's physical trajectory.
 
-        Interpolation only happens when BOTH endpoints are stable (part of a
-        run of MIN_STABLE consecutive, spatially consistent detections). This
-        prevents interpolating from a real ball position toward a head or
-        false positive that the model briefly locks onto.
+        Works on sliding windows of consecutive detections. Fits a quadratic
+        to (t, x) and (t, y) separately — a quadratic with a≈0 is a straight
+        line, so this handles both arcing shots AND straight passes.
+        Rejects frames whose residual is >3× the window median (and >30px
+        absolute, so we don't nitpick tight fits).
+        """
+        WINDOW = 5
+        n = len(self._buffer)
+        if n < WINDOW:
+            return
+        for i in range(n - WINDOW + 1):
+            boxes = [self._buffer[i + k][1] for k in range(WINDOW)]
+            if any(b is None for b in boxes):
+                continue  # need full window for fit
+            centers = [((b[0] + b[2]) / 2.0, (b[1] + b[3]) / 2.0) for b in boxes]
+            ts = np.arange(WINDOW, dtype=np.float64)
+            xs = np.array([c[0] for c in centers], dtype=np.float64)
+            ys = np.array([c[1] for c in centers], dtype=np.float64)
+            try:
+                px = np.polyfit(ts, xs, 2)
+                py = np.polyfit(ts, ys, 2)
+            except (np.linalg.LinAlgError, ValueError):
+                continue
+            xres = np.abs(xs - np.polyval(px, ts))
+            yres = np.abs(ys - np.polyval(py, ts))
+            res = np.hypot(xres, yres)
+            med = float(np.median(res))
+            if med < 10.0:
+                continue  # fit is tight; small residuals are normal
+            for k in range(WINDOW):
+                if res[k] > med * 3.0 and res[k] > 30.0:
+                    frame_img = self._buffer[i + k][0]
+                    self._buffer[i + k] = (frame_img, None, None)
+
+    def _velocity_at(self, idx: int, look_back: int = 3) -> tuple[float, float] | None:
+        """Estimate velocity (px/frame) at buffer index idx from the last
+        few detections BEFORE and including idx. Returns None if not enough
+        data."""
+        points = []
+        j = idx
+        while j >= 0 and len(points) < look_back + 1:
+            box = self._buffer[j][1]
+            if box is not None:
+                cx = (box[0] + box[2]) / 2.0
+                cy = (box[1] + box[3]) / 2.0
+                points.append((j, cx, cy))
+            j -= 1
+        if len(points) < 2:
+            return None
+        # Average velocity across consecutive pairs
+        vxs, vys = [], []
+        for a, b in zip(points[1:], points[:-1]):
+            dt = b[0] - a[0]
+            if dt <= 0:
+                continue
+            vxs.append((b[1] - a[1]) / dt)
+            vys.append((b[2] - a[2]) / dt)
+        if not vxs:
+            return None
+        return (sum(vxs) / len(vxs), sum(vys) / len(vys))
+
+    def _fill_gaps(self):
+        """Reject outlier spikes, then fill gaps.
+
+        Endpoint handling:
+          - Both endpoints stable: interpolate normally (linear for short
+            gaps, arc for longer ones).
+          - Only BEFORE stable: extrapolate forward using local velocity
+            (useful when a pass terminates in an unstable region — catch,
+            deflection, etc.). Capped at short gaps + capped distance.
+          - Only AFTER stable: extrapolate backward from after's velocity.
+          - Neither stable: skip.
         """
         self._reject_outliers()
+        self._reject_physics_outliers()
         n = len(self._buffer)
         i = 0
         while i < n:
             if self._buffer[i][1] is not None:
                 i += 1
                 continue
-            # Found a gap start — find gap end
             gap_start = i
             while i < n and self._buffer[i][1] is None:
                 i += 1
-            gap_end = i  # first frame after gap with detection (or end of buffer)
+            gap_end = i
             gap_len = gap_end - gap_start
 
             if gap_len > BALL_INTERP_MAX_GAP:
-                continue  # gap too long, don't interpolate
-
-            # Need detections on BOTH sides
+                continue
             if gap_start == 0 or gap_end >= n:
                 continue
+
             box_before = self._buffer[gap_start - 1][1]
-            box_after  = self._buffer[gap_end][1]
+            box_after = self._buffer[gap_end][1]
             if box_before is None or box_after is None:
                 continue
 
-            # Both endpoints must be stable (part of a consistent detection run)
-            if not self._is_stable_before(gap_start - 1):
-                continue
-            if not self._is_stable_after(gap_end):
+            before_stable = self._is_stable_before(gap_start - 1)
+            after_stable = self._is_stable_after(gap_end)
+
+            if not before_stable and not after_stable:
                 continue
 
-            # Check distance is reasonable
-            dist = self._box_dist(box_before, box_after)
-            if dist > self._max_teleport * (gap_len + 1):
-                continue  # ball moved too far, likely different object
-
-            # Interpolate each gap frame (arc for longer gaps, linear for short)
-            use_arc = gap_len > 3
-            for j in range(gap_start, gap_end):
-                t = (j - gap_start + 1) / (gap_len + 1)
-                if use_arc:
-                    interp_box = self._interpolate_box_arc(
-                        box_before, box_after, t, gap_len)
+            if before_stable and after_stable:
+                dist = self._box_dist(box_before, box_after)
+                if dist > self._max_teleport * (gap_len + 1):
+                    continue
+                use_arc = gap_len > 3
+                for j in range(gap_start, gap_end):
+                    t = (j - gap_start + 1) / (gap_len + 1)
+                    if use_arc:
+                        interp_box = self._interpolate_box_arc(
+                            box_before, box_after, t, gap_len)
+                    else:
+                        interp_box = self._interpolate_box(box_before, box_after, t)
+                    frame_img = self._buffer[j][0]
+                    self._buffer[j] = (frame_img, interp_box, None)
+            else:
+                # Single-sided extrapolation — more conservative
+                EXTRAP_MAX_GAP = 4
+                if gap_len > EXTRAP_MAX_GAP:
+                    continue
+                if before_stable:
+                    vel = self._velocity_at(gap_start - 1)
+                    anchor_box = box_before
+                    anchor_idx = gap_start - 1
                 else:
-                    interp_box = self._interpolate_box(box_before, box_after, t)
-                frame_img = self._buffer[j][0]
-                self._buffer[j] = (frame_img, interp_box, None)  # label=None → "INTERP"
+                    # Estimate velocity from after-side (look forward)
+                    vel = self._velocity_at_after(gap_end)
+                    anchor_box = box_after
+                    anchor_idx = gap_end
+                if vel is None:
+                    continue
+                vx, vy = vel
+                speed = math.hypot(vx, vy)
+                # Don't extrapolate from stationary anchor — meaningless
+                if speed < 5.0:
+                    continue
+                bw = anchor_box[2] - anchor_box[0]
+                bh = anchor_box[3] - anchor_box[1]
+                acx = (anchor_box[0] + anchor_box[2]) / 2.0
+                acy = (anchor_box[1] + anchor_box[3]) / 2.0
+                for j in range(gap_start, gap_end):
+                    dt = j - anchor_idx
+                    cx = acx + vx * dt
+                    cy = acy + vy * dt
+                    # Cap extrapolation distance
+                    if math.hypot(cx - acx, cy - acy) > self._max_teleport * gap_len:
+                        break
+                    interp_box = [
+                        int(cx - bw / 2), int(cy - bh / 2),
+                        int(cx + bw / 2), int(cy + bh / 2),
+                    ]
+                    frame_img = self._buffer[j][0]
+                    self._buffer[j] = (frame_img, interp_box, None)
+
+    def _velocity_at_after(self, idx: int, look_ahead: int = 3) -> tuple[float, float] | None:
+        """Estimate velocity going INTO idx from frames at/after it."""
+        n = len(self._buffer)
+        points = []
+        j = idx
+        while j < n and len(points) < look_ahead + 1:
+            box = self._buffer[j][1]
+            if box is not None:
+                cx = (box[0] + box[2]) / 2.0
+                cy = (box[1] + box[3]) / 2.0
+                points.append((j, cx, cy))
+            j += 1
+        if len(points) < 2:
+            return None
+        vxs, vys = [], []
+        for a, b in zip(points[:-1], points[1:]):
+            dt = b[0] - a[0]
+            if dt <= 0:
+                continue
+            # Velocity direction going BACKWARD from after (negate)
+            vxs.append(-(b[1] - a[1]) / dt)
+            vys.append(-(b[2] - a[2]) / dt)
+        if not vxs:
+            return None
+        return (sum(vxs) / len(vxs), sum(vys) / len(vys))
 
     def pop_ready(self) -> list:
         """Return finalized frames that are safe to write.
@@ -957,6 +1086,22 @@ class HeadLockDetector:
 
         return False
 
+    def is_near_head(self, bcx: float, bcy: float, pose_map: dict) -> bool:
+        """Instant proximity check — no history required. Returns True if
+        the point is within BALL_HEADLOCK_PROX of any visible head keypoint.
+        Used to guard cold-start jumps (which can't wait 20 frames for
+        is_head_locked to trigger)."""
+        for tid, (kps_xy, kps_conf) in pose_map.items():
+            for kp_idx in BALL_HEADLOCK_HEAD_KPS:
+                if kps_conf[kp_idx] < KP_CONF_THRESH:
+                    continue
+                kx, ky = float(kps_xy[kp_idx][0]), float(kps_xy[kp_idx][1])
+                if kx == 0.0 and ky == 0.0:
+                    continue
+                if math.hypot(bcx - kx, bcy - ky) < self._prox:
+                    return True
+        return False
+
     def clear(self):
         """Reset all offset histories (e.g. on track loss)."""
         self._offsets.clear()
@@ -967,8 +1112,20 @@ class HeadLockDetector:
 # ---------------------------------------------------------------------------
 
 class BallValidator:
-    """Validate ball detections: court boundary, teleport rejection, backboard,
-    and head-lock rejection via pose keypoints."""
+    """Validate ball detections with the following ordered checks:
+      1. Court region (polygon column test)
+      2. Velocity-aware teleport, with cold-start pathway (guarded by
+         head-proximity — cold-start jumps onto a head are rejected)
+      3. Bbox size consistency vs recent accepted detections
+      4. Backboard constraint (when ball was recently near a hoop)
+      5. Best-candidate selection: confidence × trajectory alignment
+      6. Trajectory coherence on re-acquisition (velocity-projection),
+         falls back to spatial clustering when no velocity is available
+      7. Hand/wrist proximity for stationary balls (rejects false
+         positives that can't be physically held; only fires when pose
+         data for at least one player's wrist is present in-frame)
+      8. Head-lock rejection (20-frame rigid-offset detector)
+    """
 
     def __init__(self, roi_poly: np.ndarray, frame_w: int, frame_h: int):
         self._roi_poly = roi_poly
@@ -985,50 +1142,60 @@ class BallValidator:
         self._headlock = HeadLockDetector(frame_w)
         # Velocity tracking: list of (vx, vy) per-frame deltas
         self._velocity_history: deque = deque(maxlen=BALL_VELOCITY_HISTORY)
+        # Bbox-size consistency: diagonals of last N accepted boxes
+        self._recent_sizes: deque = deque(maxlen=10)
 
     def filter(self, frame_idx: int, ball_dets: list,
                hoop_dets: list, pose_map: dict | None = None) -> list:
         """Return only plausible ball detections."""
+        speed = self._current_speed()
+
+        # --- Per-detection gates: court, teleport (w/ cold-start), size, backboard ---
         valid = []
         for d in ball_dets:
             box = d["box"]
             cx = (box[0] + box[2]) / 2.0
             cy = (box[1] + box[3]) / 2.0
 
-            # --- Check 1: Court column ---
+            # Check 1: Court column
             if not ball_in_court_region(self._roi_poly, cx, cy, self._frame_w):
                 continue
 
-            # --- Check 2: Velocity-aware teleport rejection ---
-            # Standard rule: allowed = max(base_teleport, speed * 2.5) * gap.
-            # Cold-start pathway: when velocity is ~0 (ball held, dead ball,
-            # or just established), we have no motion history to justify a
-            # large jump.  But pass/shot initiations legitimately exceed the
-            # base teleport on frame 1.  To avoid killing every pass start,
-            # allow a larger one-off jump when cold-started.  If the jump is
-            # a head-lock false positive, the HeadLockDetector and next-frame
-            # teleport check will reject it within a few frames.
+            # Check 2: Velocity-aware teleport, with cold-start pathway
+            # Standard: allowed = max(base, speed * 2.5) * gap.
+            # Cold-start: when velocity is ~0 we have no history to justify a
+            # large jump. Pass/shot starts legitimately exceed the base limit.
+            # Allow a one-off jump up to cold_start_limit, BUT reject if the
+            # landing point is directly on a head keypoint (that is not a
+            # pass start — it's a head-lock blip).
             if self._last_center is not None:
                 gap = frame_idx - self._last_frame
                 dist = math.hypot(cx - self._last_center[0],
                                   cy - self._last_center[1])
                 if 0 < gap <= BALL_TELEPORT_GRACE:
-                    speed = self._current_speed()
                     allowed = max(self._max_teleport, speed * 2.5) * gap
                     if dist > allowed:
-                        # Cold-start: no velocity to extrapolate from
                         cold_start = speed < 15.0 * self._scale
                         cold_start_limit = 350.0 * self._scale * gap
-                        if cold_start and dist <= cold_start_limit:
-                            pass  # tentatively accept the jump
-                        else:
+                        if not (cold_start and dist <= cold_start_limit):
                             continue
-                else:
-                    # Beyond grace: allow re-acquisition but only with
-                    # temporal consistency (checked below)
-                    pass
+                        # Cold-start head-proximity guard
+                        if pose_map and self._headlock.is_near_head(
+                                cx, cy, pose_map):
+                            continue
 
-            # --- Check 3: Backboard constraint ---
+            # Check 3: Bbox size consistency (skip until we have baseline)
+            if len(self._recent_sizes) >= 3:
+                bw, bh = box[2] - box[0], box[3] - box[1]
+                curr_diag = math.hypot(bw, bh)
+                sizes_sorted = sorted(self._recent_sizes)
+                median_diag = sizes_sorted[len(sizes_sorted) // 2]
+                if median_diag > 0 and (
+                        curr_diag > median_diag * 2.0 or
+                        curr_diag < median_diag * 0.5):
+                    continue
+
+            # Check 4: Backboard constraint (only when recently near hoop)
             if (self._near_hoop_box is not None and
                     frame_idx - self._near_hoop_frame <= 30):
                 hoop_top = self._near_hoop_box[1]
@@ -1043,35 +1210,51 @@ class BallValidator:
 
             valid.append(d)
 
-        # Pick the best candidate this frame (highest confidence)
+        # --- Best-candidate selection: confidence × trajectory alignment ---
+        # When trajectory info is available, prefer detections along the
+        # predicted path. When unavailable (cold-start / no velocity), fall
+        # back to raw confidence. This lets a lower-conf on-trajectory
+        # detection beat a higher-conf off-trajectory head-lock.
         best_det = None
         if valid:
-            best_det = max(valid, key=lambda d: d.get("conf", 0.0))
+            best_det = max(valid, key=lambda d: self._score(d, frame_idx, speed))
             bcx = (best_det["box"][0] + best_det["box"][2]) / 2.0
             bcy = (best_det["box"][1] + best_det["box"][3]) / 2.0
             self._recent_candidates.append((frame_idx, bcx, bcy))
         else:
             self._recent_candidates.append((frame_idx, None, None))
+            return []
 
-        # --- Check 4: Temporal consistency ---
-        # Continuing an active track: accept immediately (no delay).
-        # Re-acquiring after a gap/jump: require N-of-M clustering first
-        # to prevent locking onto a face or random object.
-        if best_det is not None:
-            bcx = (best_det["box"][0] + best_det["box"][2]) / 2.0
-            bcy = (best_det["box"][1] + best_det["box"][3]) / 2.0
+        # --- Re-acquisition check: trajectory coherence OR spatial cluster ---
+        # Active track (within grace + within allowed motion): accept now.
+        # Otherwise require either (a) trajectory-consistent re-acquisition,
+        # or (b) spatial cluster of recent candidates for stationary balls.
+        continuing_track = False
+        if self._last_center is not None:
+            gap = frame_idx - self._last_frame
+            dist = math.hypot(bcx - self._last_center[0],
+                              bcy - self._last_center[1])
+            allowed = max(self._max_teleport, speed * 2.5) * gap
+            if gap <= BALL_TELEPORT_GRACE and dist <= allowed:
+                continuing_track = True
 
-            continuing_track = False
-            if self._last_center is not None:
+        if not continuing_track:
+            have_velocity = (speed > 5.0 * self._scale and
+                             self._last_center is not None)
+            if have_velocity:
+                # Project last known position along average velocity
+                avg_vx = sum(v[0] for v in self._velocity_history) / len(self._velocity_history)
+                avg_vy = sum(v[1] for v in self._velocity_history) / len(self._velocity_history)
                 gap = frame_idx - self._last_frame
-                dist = math.hypot(bcx - self._last_center[0],
-                                  bcy - self._last_center[1])
-                speed = self._current_speed()
-                allowed = max(self._max_teleport, speed * 2.5) * gap
-                if gap <= BALL_TELEPORT_GRACE and dist <= allowed:
-                    continuing_track = True
-
-            if not continuing_track:
+                pred_x = self._last_center[0] + avg_vx * gap
+                pred_y = self._last_center[1] + avg_vy * gap
+                pred_dist = math.hypot(bcx - pred_x, bcy - pred_y)
+                # Uncertainty grows with gap
+                tolerance = self._max_teleport * max(1.0, gap * 0.6)
+                if pred_dist > tolerance:
+                    return []
+            else:
+                # No velocity info — spatial clustering (stationary ball case)
                 nearby = 0
                 for _, rx, ry in self._recent_candidates:
                     if rx is not None:
@@ -1080,42 +1263,48 @@ class BallValidator:
                 if nearby < BALL_TEMPORAL_MIN:
                     return []
 
-            # --- Check 5: Head-lock rejection ---
-            # If the ball candidate has been rigidly tracking a player's
-            # head keypoints (near-zero relative motion) for 20+ frames,
-            # it's a bald head, not a ball.  Clears tracker state on reject
-            # so the real ball can re-acquire without fighting temporal gates.
-            if pose_map and self._headlock.is_head_locked(bcx, bcy, pose_map):
-                self._headlock.clear()
-                self._last_center = None
-                self._last_frame = -999
-                self._recent_candidates.clear()
-                self._velocity_history.clear()
+        # --- Wrist proximity for stationary balls ---
+        # A stationary ball should be near someone's wrist (held). This only
+        # fires when: ball is stationary, pose data exists, AND at least one
+        # player has a detectable wrist in-frame. Missing pose → skip (don't
+        # penalize without evidence).
+        if pose_map and speed < 8.0 * self._scale:
+            if not self._near_any_wrist(bcx, bcy, pose_map):
                 return []
 
-            # Update velocity history
-            if self._last_center is not None:
-                gap = frame_idx - self._last_frame
-                if 0 < gap <= 3:  # only track velocity from nearby frames
-                    vx = (bcx - self._last_center[0]) / gap
-                    vy = (bcy - self._last_center[1]) / gap
-                    self._velocity_history.append((vx, vy))
-            else:
-                self._velocity_history.clear()
+        # --- Head-lock rejection (20-frame rigid offset) ---
+        if pose_map and self._headlock.is_head_locked(bcx, bcy, pose_map):
+            self._headlock.clear()
+            self._last_center = None
+            self._last_frame = -999
+            self._recent_candidates.clear()
+            self._velocity_history.clear()
+            self._recent_sizes.clear()
+            return []
 
-            self._last_center = (bcx, bcy)
-            self._last_frame = frame_idx
-            for h in hoop_dets:
-                if self._near_any_hoop(bcx, bcy, [h]):
-                    self._near_hoop_frame = frame_idx
-                    self._near_hoop_box = h["box"]
-                    break
-            return [best_det]
+        # --- Accept: update state ---
+        if self._last_center is not None:
+            gap = frame_idx - self._last_frame
+            if 0 < gap <= 3:
+                vx = (bcx - self._last_center[0]) / gap
+                vy = (bcy - self._last_center[1]) / gap
+                self._velocity_history.append((vx, vy))
+        else:
+            self._velocity_history.clear()
 
-        # No ball detected this frame — still feed the headlock detector
-        # a "miss" so offset histories don't stale (they'll be pruned
-        # naturally since no tid will match next frame).
-        return []
+        # Record accepted bbox size
+        bw, bh = (best_det["box"][2] - best_det["box"][0],
+                  best_det["box"][3] - best_det["box"][1])
+        self._recent_sizes.append(math.hypot(bw, bh))
+
+        self._last_center = (bcx, bcy)
+        self._last_frame = frame_idx
+        for h in hoop_dets:
+            if self._near_any_hoop(bcx, bcy, [h]):
+                self._near_hoop_frame = frame_idx
+                self._near_hoop_box = h["box"]
+                break
+        return [best_det]
 
     def _current_speed(self) -> float:
         """Average speed (px/frame) from recent velocity history."""
@@ -1123,6 +1312,53 @@ class BallValidator:
             return 0.0
         speeds = [math.hypot(vx, vy) for vx, vy in self._velocity_history]
         return sum(speeds) / len(speeds)
+
+    def _score(self, det: dict, frame_idx: int, speed: float) -> float:
+        """Score a detection: confidence × trajectory alignment.
+
+        If no trajectory info (no last_center, or no velocity history, or
+        velocity too low to project meaningfully) return raw conf. Otherwise
+        multiply conf by 0.5-1.0 depending on how well the detection matches
+        the predicted position.
+        """
+        conf = det.get("conf", 0.0)
+        if (self._last_center is None or not self._velocity_history or
+                speed < 5.0 * self._scale):
+            return conf
+        avg_vx = sum(v[0] for v in self._velocity_history) / len(self._velocity_history)
+        avg_vy = sum(v[1] for v in self._velocity_history) / len(self._velocity_history)
+        gap = max(1, frame_idx - self._last_frame)
+        pred_x = self._last_center[0] + avg_vx * gap
+        pred_y = self._last_center[1] + avg_vy * gap
+        cx = (det["box"][0] + det["box"][2]) / 2.0
+        cy = (det["box"][1] + det["box"][3]) / 2.0
+        dist = math.hypot(cx - pred_x, cy - pred_y)
+        tolerance = max(self._max_teleport, speed * 2.5) * gap
+        alignment = max(0.0, 1.0 - dist / tolerance) if tolerance > 0 else 0.0
+        return conf * (0.5 + 0.5 * alignment)
+
+    def _near_any_wrist(self, bcx: float, bcy: float, pose_map: dict) -> bool:
+        """Return True if any player has a visible wrist within proximity,
+        OR if NO wrist is detectable in-frame at all (conservative — don't
+        penalize when pose data is missing).
+
+        COCO keypoints 9 = left_wrist, 10 = right_wrist.
+        """
+        WRIST_KPS = (9, 10)
+        WRIST_PROX = 80.0 * self._scale
+        any_wrist_visible = False
+        for _, (kps_xy, kps_conf) in pose_map.items():
+            for kp_idx in WRIST_KPS:
+                if kps_conf[kp_idx] < KP_CONF_THRESH:
+                    continue
+                wx, wy = float(kps_xy[kp_idx][0]), float(kps_xy[kp_idx][1])
+                if wx == 0.0 and wy == 0.0:
+                    continue
+                any_wrist_visible = True
+                if math.hypot(bcx - wx, bcy - wy) <= WRIST_PROX:
+                    return True
+        # If no wrist was detectable at all, don't penalize
+        return not any_wrist_visible
 
     def _near_any_hoop(self, cx: float, cy: float, hoop_dets: list) -> bool:
         margin = self._frame_w * 0.08
