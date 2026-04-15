@@ -97,6 +97,7 @@ BALL_HEADLOCK_WINDOW   = 20    # frames of offset history to evaluate (~333ms at
 BALL_HEADLOCK_MAX_VAR  = 6.0   # max px std-dev of offset to count as "locked" to a head
 BALL_HEADLOCK_HEAD_KPS = (0, 1, 2, 3, 4)  # COCO: nose, left_eye, right_eye, left_ear, right_ear
 BALL_HEADLOCK_PROX     = 80    # px — ball must be this close to a head kp to start tracking offset
+HEADLOCK_PERSIST_FRAMES = 5    # consecutive head-locks before clearing track state (soft reject otherwise)
 
 # Court visibility detection
 COURT_MIN_LINES      = 4       # min Hough lines to consider court visible
@@ -870,16 +871,10 @@ class BallInterpolator:
         return (sum(vxs) / len(vxs), sum(vys) / len(vys))
 
     def _fill_gaps(self):
-        """Reject outlier spikes, then fill gaps.
-
-        Endpoint handling:
-          - Both endpoints stable: interpolate normally (linear for short
-            gaps, arc for longer ones).
-          - Only BEFORE stable: extrapolate forward using local velocity
-            (useful when a pass terminates in an unstable region — catch,
-            deflection, etc.). Capped at short gaps + capped distance.
-          - Only AFTER stable: extrapolate backward from after's velocity.
-          - Neither stable: skip.
+        """Reject outlier spikes, then fill gaps between two stable endpoints.
+        Single-sided extrapolation is intentionally not done — projecting the
+        last velocity forward when the ball stops being detected was flinging
+        the box toward the frame edge on lost tracks.
         """
         self._reject_outliers()
         self._reject_physics_outliers()
@@ -905,90 +900,26 @@ class BallInterpolator:
             if box_before is None or box_after is None:
                 continue
 
-            before_stable = self._is_stable_before(gap_start - 1)
-            after_stable = self._is_stable_after(gap_end)
-
-            if not before_stable and not after_stable:
+            # Gaps only fill when BOTH endpoints are stable real detections.
+            # Single-sided extrapolation was flying the box off-screen when a
+            # fast ball went undetected (pass end / off-court).
+            if not (self._is_stable_before(gap_start - 1)
+                    and self._is_stable_after(gap_end)):
                 continue
 
-            if before_stable and after_stable:
-                dist = self._box_dist(box_before, box_after)
-                if dist > self._max_teleport * (gap_len + 1):
-                    continue
-                use_arc = gap_len > 3
-                for j in range(gap_start, gap_end):
-                    t = (j - gap_start + 1) / (gap_len + 1)
-                    if use_arc:
-                        interp_box = self._interpolate_box_arc(
-                            box_before, box_after, t, gap_len)
-                    else:
-                        interp_box = self._interpolate_box(box_before, box_after, t)
-                    frame_img = self._buffer[j][0]
-                    self._buffer[j] = (frame_img, interp_box, None)
-            else:
-                # Single-sided extrapolation — more conservative
-                EXTRAP_MAX_GAP = 4
-                if gap_len > EXTRAP_MAX_GAP:
-                    continue
-                if before_stable:
-                    vel = self._velocity_at(gap_start - 1)
-                    anchor_box = box_before
-                    anchor_idx = gap_start - 1
+            dist = self._box_dist(box_before, box_after)
+            if dist > self._max_teleport * (gap_len + 1):
+                continue
+            use_arc = gap_len > 3
+            for j in range(gap_start, gap_end):
+                t = (j - gap_start + 1) / (gap_len + 1)
+                if use_arc:
+                    interp_box = self._interpolate_box_arc(
+                        box_before, box_after, t, gap_len)
                 else:
-                    # Estimate velocity from after-side (look forward)
-                    vel = self._velocity_at_after(gap_end)
-                    anchor_box = box_after
-                    anchor_idx = gap_end
-                if vel is None:
-                    continue
-                vx, vy = vel
-                speed = math.hypot(vx, vy)
-                # Don't extrapolate from stationary anchor — meaningless
-                if speed < 5.0:
-                    continue
-                bw = anchor_box[2] - anchor_box[0]
-                bh = anchor_box[3] - anchor_box[1]
-                acx = (anchor_box[0] + anchor_box[2]) / 2.0
-                acy = (anchor_box[1] + anchor_box[3]) / 2.0
-                for j in range(gap_start, gap_end):
-                    dt = j - anchor_idx
-                    cx = acx + vx * dt
-                    cy = acy + vy * dt
-                    # Cap extrapolation distance
-                    if math.hypot(cx - acx, cy - acy) > self._max_teleport * gap_len:
-                        break
-                    interp_box = [
-                        int(cx - bw / 2), int(cy - bh / 2),
-                        int(cx + bw / 2), int(cy + bh / 2),
-                    ]
-                    frame_img = self._buffer[j][0]
-                    self._buffer[j] = (frame_img, interp_box, None)
-
-    def _velocity_at_after(self, idx: int, look_ahead: int = 3) -> tuple[float, float] | None:
-        """Estimate velocity going INTO idx from frames at/after it."""
-        n = len(self._buffer)
-        points = []
-        j = idx
-        while j < n and len(points) < look_ahead + 1:
-            box = self._buffer[j][1]
-            if box is not None:
-                cx = (box[0] + box[2]) / 2.0
-                cy = (box[1] + box[3]) / 2.0
-                points.append((j, cx, cy))
-            j += 1
-        if len(points) < 2:
-            return None
-        vxs, vys = [], []
-        for a, b in zip(points[:-1], points[1:]):
-            dt = b[0] - a[0]
-            if dt <= 0:
-                continue
-            # Velocity direction going BACKWARD from after (negate)
-            vxs.append(-(b[1] - a[1]) / dt)
-            vys.append(-(b[2] - a[2]) / dt)
-        if not vxs:
-            return None
-        return (sum(vxs) / len(vxs), sum(vys) / len(vys))
+                    interp_box = self._interpolate_box(box_before, box_after, t)
+                frame_img = self._buffer[j][0]
+                self._buffer[j] = (frame_img, interp_box, None)
 
     def pop_ready(self) -> list:
         """Return finalized frames that are safe to write.
@@ -1144,6 +1075,10 @@ class BallValidator:
         self._velocity_history: deque = deque(maxlen=BALL_VELOCITY_HISTORY)
         # Bbox-size consistency: diagonals of last N accepted boxes
         self._recent_sizes: deque = deque(maxlen=10)
+        # Consecutive head-lock hits — only clear state after persistent lock
+        self._headlock_consec: int = 0
+        # Consecutive bbox-size-band violations — single-frame noise passes
+        self._size_violations: int = 0
 
     def filter(self, frame_idx: int, ball_dets: list,
                hoop_dets: list, pose_map: dict | None = None) -> list:
@@ -1176,7 +1111,11 @@ class BallValidator:
                     allowed = max(self._max_teleport, speed * 2.5) * gap
                     if dist > allowed:
                         cold_start = speed < 15.0 * self._scale
-                        cold_start_limit = 350.0 * self._scale * gap
+                        # Cold-start is a one-off allowance, not a per-frame
+                        # budget — cap the absolute limit so gap >=3 can't
+                        # permit 1000+ px jumps across the frame.
+                        cold_start_limit = min(700.0 * self._scale,
+                                               350.0 * self._scale * gap)
                         if not (cold_start and dist <= cold_start_limit):
                             continue
                         # Cold-start head-proximity guard
@@ -1184,16 +1123,23 @@ class BallValidator:
                                 cx, cy, pose_map):
                             continue
 
-            # Check 3: Bbox size consistency (skip until we have baseline)
+            # Check 3: Bbox size consistency (skip until we have baseline).
+            # Widened band (2.5x / 0.4x) and single-frame violations pass —
+            # only reject on the second consecutive out-of-band hit, so motion
+            # blur or partial occlusion doesn't drop a valid track.
             if len(self._recent_sizes) >= 3:
                 bw, bh = box[2] - box[0], box[3] - box[1]
                 curr_diag = math.hypot(bw, bh)
                 sizes_sorted = sorted(self._recent_sizes)
                 median_diag = sizes_sorted[len(sizes_sorted) // 2]
                 if median_diag > 0 and (
-                        curr_diag > median_diag * 2.0 or
-                        curr_diag < median_diag * 0.5):
-                    continue
+                        curr_diag > median_diag * 2.5 or
+                        curr_diag < median_diag * 0.4):
+                    self._size_violations += 1
+                    if self._size_violations >= 2:
+                        continue
+                else:
+                    self._size_violations = 0
 
             # Check 4: Backboard constraint (only when recently near hoop)
             if (self._near_hoop_box is not None and
@@ -1249,8 +1195,10 @@ class BallValidator:
                 pred_x = self._last_center[0] + avg_vx * gap
                 pred_y = self._last_center[1] + avg_vy * gap
                 pred_dist = math.hypot(bcx - pred_x, bcy - pred_y)
-                # Uncertainty grows with gap
-                tolerance = self._max_teleport * max(1.0, gap * 0.6)
+                # Uncertainty grows with gap. Wider than a rigid projection
+                # so rebounds and deflections can be re-acquired — trajectory
+                # alignment is a prior, not a hard constraint.
+                tolerance = self._max_teleport * max(1.5, gap * 1.0)
                 if pred_dist > tolerance:
                     return []
             else:
@@ -1272,15 +1220,23 @@ class BallValidator:
             if not self._near_any_wrist(bcx, bcy, pose_map):
                 return []
 
-        # --- Head-lock rejection (20-frame rigid offset) ---
+        # --- Head-lock rejection (soft: drop detection, keep state) ---
+        # A single head-lock hit is likely a brief face-overlap during a pass
+        # — hard-resetting state causes a visible annotation glitch on the
+        # next frame. Only clear the track when the lock persists for
+        # HEADLOCK_PERSIST_FRAMES consecutive frames.
         if pose_map and self._headlock.is_head_locked(bcx, bcy, pose_map):
-            self._headlock.clear()
-            self._last_center = None
-            self._last_frame = -999
-            self._recent_candidates.clear()
-            self._velocity_history.clear()
-            self._recent_sizes.clear()
+            self._headlock_consec += 1
+            if self._headlock_consec >= HEADLOCK_PERSIST_FRAMES:
+                self._headlock.clear()
+                self._last_center = None
+                self._last_frame = -999
+                self._recent_candidates.clear()
+                self._velocity_history.clear()
+                self._recent_sizes.clear()
+                self._headlock_consec = 0
             return []
+        self._headlock_consec = 0
 
         # --- Accept: update state ---
         if self._last_center is not None:
@@ -1377,33 +1333,16 @@ class BallValidator:
 def is_court_visible(frame: np.ndarray) -> bool:
     """Detect whether the basketball court is visible in this frame.
 
-    Uses two checks:
-      1. Wood floor detection — court floors are tan/brown wood with a
-         distinctive HSV range unlike skin, jerseys, or crowd colors
-      2. Hough line detection — courts have many straight painted lines
-         (any color) visible as edges against the wood
-    Both must pass to return True.
+    Wood floor color ratio only — the Hough line check (~8ms/frame) was
+    removed. Broadcast camera is almost always on court, and the court ROI
+    polygon already filters off-court ball detections. HSV check is ~1ms.
     """
     h, w = frame.shape[:2]
-    # Downsample for speed
-    small = cv2.resize(frame, (w // 2, h // 2))
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-
-    # --- Check 1: Wood floor color ratio (HSV) ---
-    # Basketball court wood is tan/light brown: low-mid saturation, high value
+    small = cv2.resize(frame, (w // 4, h // 4))  # 4× downsample is enough
     hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
     wood_mask = cv2.inRange(hsv, (10, 30, 120), (30, 180, 240))
     wood_ratio = wood_mask.sum() / 255.0 / (wood_mask.shape[0] * wood_mask.shape[1])
-    if wood_ratio < COURT_WOOD_RATIO:
-        return False
-
-    # --- Check 2: Hough line detection ---
-    # Court lines (any color) create strong edges against the wood floor
-    edges = cv2.Canny(gray, 50, 150)
-    lines = cv2.HoughLinesP(edges, 1, np.pi / 180,
-                            threshold=80, minLineLength=40, maxLineGap=10)
-    num_lines = 0 if lines is None else len(lines)
-    return num_lines >= COURT_MIN_LINES
+    return wood_ratio >= COURT_WOOD_RATIO
 
 
 def build_court_roi(frame_w: int, frame_h: int) -> np.ndarray:
@@ -1828,7 +1767,10 @@ def _load_model(pt_path: str, imgsz: int, label: str) -> YOLO:
 @torch.inference_mode()
 def run(video_path: str, out_dir: str, weights: str | None = None,
         use_tracknet: bool = True,
-        tracknet_weights: str | None = None):
+        tracknet_weights: str | None = None,
+        no_pipeline: bool = False,
+        use_yolo_ball: bool = False,
+        out_name: str = "annotated"):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     cap = cv2.VideoCapture(video_path)
@@ -1844,7 +1786,9 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
 
     device = get_device()
     if device.startswith("cuda"):
-        infer_imgsz = 1280
+        infer_imgsz = 960   # 1280 → 960: ~20ms saved per YOLO call, no visible
+                             # difference for large objects (player/ref/hoop).
+                             # Ball detection uses TrackNet at fixed 640×360.
         use_half    = True
     else:
         infer_imgsz = 640
@@ -1893,7 +1837,7 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
 
     fourcc    = cv2.VideoWriter_fourcc(*"mp4v")
     out_video = cv2.VideoWriter(
-        str(Path(out_dir) / "annotated.mp4"), fourcc, fps, (frame_w, frame_h)
+        str(Path(out_dir) / f"{out_name}.mp4"), fourcc, fps, (frame_w, frame_h)
     )
 
     frame_idx = 0
@@ -1920,9 +1864,9 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         if frame_idx % frame_skip != 0:
             tracknet_ball_box = None
             if tracknet_model is not None:
-                tn_det = tracknet_model.predict(frame)
-                if is_court_visible(frame) and tn_det is not None:
-                    tracknet_ball_box = tn_det["box"]
+                tn_dets = tracknet_model.predict(frame)
+                if is_court_visible(frame) and tn_dets:
+                    tracknet_ball_box = tn_dets[0]["box"]
 
             # Redraw all non-ball annotations from the last processed frame
             for det in cached_hoop_dets:
@@ -1993,6 +1937,11 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                 elif cls_id == CLS_REF:
                     if conf_val >= 0.30:
                         ref_dets.append({"tid": tid, "box": box_list, "cls": CLS_REF})
+                elif cls_id == CLS_BALL and use_yolo_ball:
+                    if conf_val >= 0.25:
+                        ball_dets.append({"tid": -1, "box": box_list,
+                                          "cls": CLS_BALL, "conf": conf_val})
+                        ball_source = "YOLO"
 
         # ---- 1a. Court visibility check ----------------------------------------
         court_visible = is_court_visible(frame)
@@ -2002,9 +1951,9 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         # regression — much better at small, fast-moving balls than YOLO.
         # Skip ball detection when court is not visible (closeups/replays).
         if tracknet_model is not None:
-            tn_det = tracknet_model.predict(frame)
-            if court_visible and tn_det is not None:
-                ball_dets.append(tn_det)
+            tn_dets = tracknet_model.predict(frame)
+            if court_visible and tn_dets:
+                ball_dets.extend(tn_dets)
                 ball_source = "TrackNet"
 
         # ---- 2. Re-ID + memory + velocity ------------------------------------
@@ -2040,9 +1989,16 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         pose_map = cached_pose_map
 
         # ---- 5. Ball validation + tracking ------------------------------------
-        ball_dets    = ball_validator.filter(frame_idx, ball_dets, hoop_dets,
-                                            pose_map=pose_map)
-        ball_to_draw = ball_tracker.update(frame_idx, ball_dets)
+        if no_pipeline:
+            # Raw mode: skip validator / Kalman tracker / interpolator.
+            # Draw the highest-conf detection directly.
+            ball_to_draw = (sorted(ball_dets, key=lambda d: d.get("conf", 0),
+                                   reverse=True)[:1]
+                            if ball_dets else [])
+        else:
+            ball_dets    = ball_validator.filter(frame_idx, ball_dets, hoop_dets,
+                                                pose_map=pose_map)
+            ball_to_draw = ball_tracker.update(frame_idx, ball_dets)
 
         # ---- 6. Draw hoop / ref / players (everything except ball) ------------
         for det in hoop_dets:
@@ -2074,18 +2030,26 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         cached_ref_dets = ref_dets
         cached_pose_map = pose_map
 
-        # ---- 7. Buffer frame for ball interpolation --------------------------
-        # Ball is NOT drawn yet — the interpolator will fill gaps first.
+        # ---- 7. Ball output (interpolated pipeline or raw) ---------------------
         ball_box = ball_to_draw[0]["box"] if ball_to_draw else None
-        last_ball_box = ball_box  # cache for skipped frames
+        last_ball_box = ball_box
         ball_label = f"BALL ({ball_source})" if ball_box else None
-        ball_interp.push(frame, ball_box, ball_label)
+        if no_pipeline:
+            # Draw immediately — no interpolation buffer
+            if ball_box is not None:
+                draw_ball(frame, ball_box, label=ball_label or "BALL")
+        else:
+            # Ball is NOT drawn yet — the interpolator will fill gaps first.
+            ball_interp.push(frame, ball_box, ball_label)
 
-        # Write finalized frames (interpolator releases them after look-ahead)
-        for fin_frame, fin_ball_box, fin_label in ball_interp.pop_ready():
-            if fin_ball_box is not None:
-                draw_ball(fin_frame, fin_ball_box, label=fin_label or "BALL (INTERP)")
-            out_video.write(fin_frame)
+        if no_pipeline:
+            out_video.write(frame)
+        else:
+            # Write finalized frames (interpolator releases them after look-ahead)
+            for fin_frame, fin_ball_box, fin_label in ball_interp.pop_ready():
+                if fin_ball_box is not None:
+                    draw_ball(fin_frame, fin_ball_box, label=fin_label or "BALL (INTERP)")
+                out_video.write(fin_frame)
 
         frame_idx += 1
 
@@ -2099,16 +2063,18 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
                   f"| poses={len(pose_map)}  "
                   f"| ball={ball_source if ball_to_draw else 'no'}")
 
-    # Flush remaining buffered frames
-    for fin_frame, fin_ball_box, fin_label in ball_interp.flush():
-        if fin_ball_box is not None:
-            draw_ball(fin_frame, fin_ball_box, label=fin_label or "BALL (INTERP)")
-        out_video.write(fin_frame)
+    if not no_pipeline:
+        # Flush remaining buffered frames
+        for fin_frame, fin_ball_box, fin_label in ball_interp.flush():
+            if fin_ball_box is not None:
+                draw_ball(fin_frame, fin_ball_box, label=fin_label or "BALL (INTERP)")
+            out_video.write(fin_frame)
 
+    out_path = Path(out_dir) / f"{out_name}.mp4"
     cap.release()
     out_video.release()
     print(f"\nDone — {frame_idx} frames processed.")
-    print(f"  Annotated video : {Path(out_dir) / 'annotated.mp4'}")
+    print(f"  Annotated video : {out_path}")
     print(f"  Jersey numbers found: {dict(jersey_ocr._confirmed)}")
 
 

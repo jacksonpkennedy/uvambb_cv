@@ -42,6 +42,19 @@ except ImportError:
 
 INPUT_W, INPUT_H = 640, 360    # TrackNet canonical resolution
 
+# Top-K candidate extraction from the heatmap. The argmax alone is not enough:
+# when the ball is near a face, the face can briefly win confidence, while the
+# real ball sits as a secondary peak. Returning multiple candidates lets the
+# validator pick the one best aligned with the predicted trajectory.
+TN_TOPK = 3
+TN_NMS_RADIUS = 20        # model-space pixels suppressed around each peak
+TN_RUNNER_UP_CONF = 0.30  # runner-ups must clear this to be returned
+
+# Visibility classification head
+VIS_LAMBDA = 0.1          # weight of vis BCE loss relative to heatmap focal loss
+                          # Keep low so heatmap training dominates while vis_head bootstraps
+VIS_THRESH_INFER = 0.25   # below this vis_prob at inference → return [] (no ball)
+
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, pad=1,
@@ -91,6 +104,18 @@ class TrackNetV3(nn.Module):
         self.conv10 = ConvBlock(256, 256)       # bottleneck (256ch, /8 res)
         self.bottleneck_dropout = nn.Dropout2d(p=0.2)
 
+        # --- Visibility classification head ---
+        # Runs off the bottleneck (global view of frame) to predict whether
+        # the ball is visible at all. Suppresses FP on fully-occluded frames.
+        # AdaptiveAvgPool → flatten → 256→64→1 (logit, no sigmoid here)
+        self.vis_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(256, 64),
+            nn.ReLU(inplace=True),
+            nn.Linear(64, 1),
+        )
+
         # --- Decoder (with skip connections) ---
         # After ups1: 256ch. cat with skip3(256ch) ->512ch
         self.ups1 = nn.Upsample(scale_factor=2)
@@ -127,9 +152,12 @@ class TrackNetV3(nn.Module):
         x = self.conv8(x)
         x = self.conv9(x)
         x = self.conv10(x)
-        x = self.bottleneck_dropout(x)
+        bottleneck = self.bottleneck_dropout(x)
 
-        x = self.ups1(x)
+        # Visibility head — branches off bottleneck before decoder
+        vis_logit = self.vis_head(bottleneck)   # (B, 1)
+
+        x = self.ups1(bottleneck)
         x = torch.cat([x, skip3], dim=1)        # 256+256=512
         x = self.conv11(x)
         x = self.conv12(x)
@@ -143,7 +171,7 @@ class TrackNetV3(nn.Module):
         x = self.conv16(x)
         x = self.conv17(x)
         x = self.conv18(x)
-        return x                                # always raw logits
+        return x, vis_logit                     # (heatmap logits, vis logit)
 
     def _init_weights(self):
         for m in self.modules():
@@ -170,57 +198,98 @@ class TrackNetV3(nn.Module):
 def postprocess_heatmap(heatmap: np.ndarray,
                         scale_x: float = 1.0,
                         scale_y: float = 1.0,
-                        local_radius: int = 10) -> tuple:
-    """Convert sigmoid heatmap ->ball center (x, y, conf) in original coords.
+                        local_radius: int = 10,
+                        motion_map: np.ndarray | None = None,
+                        motion_floor: float = 0.3,
+                        motion_dilate: int = 15) -> list:
+    """Convert sigmoid heatmap -> list of up to TN_TOPK ball candidates.
 
-    Finds the global peak, then computes a weighted centroid in a local window
-    around that peak. This prevents drifting between two competing hot spots
-    (e.g. ball and hoop both activating) which caused frame-to-frame jumping.
+    Each candidate is (x, y, conf) in original frame coordinates. The global
+    peak is always returned first; subsequent peaks are found by NMS-masking
+    a TN_NMS_RADIUS window around each accepted peak and must clear
+    TN_RUNNER_UP_CONF to be included. Returns [] if the top peak is below 0.1.
+
+    Motion gate (V4-style): if `motion_map` is supplied, the heatmap is
+    multiplied by (floor + (1 - floor) * normalized_motion) before peak
+    extraction. This kills high-confidence peaks on stationary distractors
+    (orange shoes, court logos) while preserving real detections that briefly
+    pause. The diff map is dilated so a peak slightly off-center from the
+    motion streak still gets credit for being near motion.
 
     Args:
         heatmap: (1, H, W) or (H, W) float32 in [0, 1] — sigmoid output
         scale_x: frame_w / INPUT_W
         scale_y: frame_h / INPUT_H
         local_radius: half-size of local window for centroid (model pixels)
-
-    Returns:
-        (x, y, conf) in original frame coordinates, or (None, None, 0.0)
+        motion_map: optional (1, H, W) or (H, W) float32 in [0, 1] — |f_t - f_{t-1}|
+                    averaged over RGB (same as the model input diff channel)
+        motion_floor: minimum gate multiplier in pure-static regions (0..1).
+                      0.3 means a stationary high-conf peak is scaled to 30%;
+                      a moving peak is unchanged.
+        motion_dilate: dilation kernel size applied to the motion map before
+                       gating, so nearby peaks share credit with the motion streak.
     """
     if heatmap.ndim == 3:
         heatmap = heatmap[0]
     heatmap = heatmap.reshape(INPUT_H, INPUT_W).astype(np.float32)
-
-    # Slight blur to suppress single-pixel noise before finding peak
     heatmap = cv2.GaussianBlur(heatmap, (5, 5), 1.0)
 
-    conf = float(heatmap.max())
-    if conf < 0.1:
-        return None, None, 0.0
+    if motion_map is not None:
+        m = motion_map[0] if motion_map.ndim == 3 else motion_map
+        m = m.reshape(INPUT_H, INPUT_W).astype(np.float32)
+        # Dilate so a peak a few px away from the motion streak still counts.
+        if motion_dilate > 0:
+            k = np.ones((motion_dilate, motion_dilate), dtype=np.float32)
+            m = cv2.dilate(m, k)
+        # Normalize to [0, 1] via a robust percentile (frame-by-frame diffs
+        # are tiny in magnitude; .max() alone is noisy).
+        m_hi = float(np.percentile(m, 99.0))
+        if m_hi > 1e-6:
+            m = np.clip(m / m_hi, 0.0, 1.0)
+        else:
+            m = np.zeros_like(m)
+        gate = motion_floor + (1.0 - motion_floor) * m
+        heatmap = heatmap * gate
 
-    # Find peak pixel
-    flat_idx = int(heatmap.argmax())
-    peak_y, peak_x = divmod(flat_idx, INPUT_W)
+    candidates: list = []
+    # First peak uses the detection floor (0.1); subsequent peaks must clear
+    # the higher runner-up threshold.
+    threshold = 0.1
+    for k in range(TN_TOPK):
+        peak_val = float(heatmap.max())
+        if peak_val < threshold:
+            break
 
-    # Weighted centroid in local window around peak only
-    # This isolates the ball blob and ignores other hot regions
-    y0 = max(0, peak_y - local_radius)
-    y1 = min(INPUT_H, peak_y + local_radius + 1)
-    x0 = max(0, peak_x - local_radius)
-    x1 = min(INPUT_W, peak_x + local_radius + 1)
+        flat_idx = int(heatmap.argmax())
+        peak_y, peak_x = divmod(flat_idx, INPUT_W)
 
-    patch = heatmap[y0:y1, x0:x1]
-    threshold = 0.5 * conf
-    mask = patch >= threshold
-    if mask.any():
-        ys, xs = np.where(mask)
-        weights = patch[ys, xs]
-        total = float(weights.sum())
-        cx = float((xs * weights).sum() / total + x0) * scale_x
-        cy = float((ys * weights).sum() / total + y0) * scale_y
-        return cx, cy, conf
+        y0 = max(0, peak_y - local_radius)
+        y1 = min(INPUT_H, peak_y + local_radius + 1)
+        x0 = max(0, peak_x - local_radius)
+        x1 = min(INPUT_W, peak_x + local_radius + 1)
+        patch = heatmap[y0:y1, x0:x1]
+        mask = patch >= 0.5 * peak_val
+        if mask.any():
+            ys, xs = np.where(mask)
+            weights = patch[ys, xs]
+            total = float(weights.sum())
+            cx = float((xs * weights).sum() / total + x0) * scale_x
+            cy = float((ys * weights).sum() / total + y0) * scale_y
+        else:
+            cx = float(peak_x) * scale_x
+            cy = float(peak_y) * scale_y
+        candidates.append((cx, cy, peak_val))
 
-    # Fallback: raw peak location
-    return float(peak_x) * scale_x, float(peak_y) * scale_y, conf
+        # NMS: zero out a window around this peak so it can't win again
+        ny0 = max(0, peak_y - TN_NMS_RADIUS)
+        ny1 = min(INPUT_H, peak_y + TN_NMS_RADIUS + 1)
+        nx0 = max(0, peak_x - TN_NMS_RADIUS)
+        nx1 = min(INPUT_W, peak_x + TN_NMS_RADIUS + 1)
+        heatmap[ny0:ny1, nx0:nx1] = 0.0
+
+        threshold = TN_RUNNER_UP_CONF
+
+    return candidates
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +328,16 @@ def generate_heatmap(cx: int, cy: int, w: int = INPUT_W, h: int = INPUT_H,
 # ---------------------------------------------------------------------------
 # CenterNet focal loss — heatmap regression (Zhou et al. 2019)
 # ---------------------------------------------------------------------------
+
+def vis_bce_loss(vis_logit: torch.Tensor, vis_flag: torch.Tensor) -> torch.Tensor:
+    """BCE loss for the visibility classification head.
+
+    vis_logit: (B, 1) raw logit
+    vis_flag:  (B,)   int tensor, 1=ball visible, 0=no ball
+    """
+    return torch.nn.functional.binary_cross_entropy_with_logits(
+        vis_logit.squeeze(1), vis_flag.float())
+
 
 def focal_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """CenterNet focal loss (Zhou et al. 2019, Objects as Points).
@@ -304,6 +383,7 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
     tp = fp = fn = 0
     total_loss = 0.0
     margins = []                      # peak - highest-distractor on visible frames
+    vis_correct = vis_total = 0       # visibility head accuracy
     game_stats: dict[str, dict] = {}  # {game: {tp, fp, fn}}
     model.eval()
     use_amp = device != "cpu"
@@ -311,8 +391,14 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
         for inp, target, vis_flags, games in loader:
             inp    = inp.to(device, non_blocking=True)
             target = target.to(device, non_blocking=True)
-            out    = model(inp)          # (B, 1, H, W) logits
-            total_loss += focal_loss(out, target).item()
+            vis_flags_dev = vis_flags.to(device, non_blocking=True)
+            out, vis_logit = model(inp)  # (B, 1, H, W) logits, (B, 1) vis logit
+            total_loss += (focal_loss(out, target)
+                           + VIS_LAMBDA * vis_bce_loss(vis_logit, vis_flags_dev)).item()
+            # Vis head accuracy
+            vis_pred = (torch.sigmoid(vis_logit.squeeze(1)) >= 0.5).cpu()
+            vis_correct += (vis_pred == vis_flags.bool()).sum().item()
+            vis_total   += vis_flags.shape[0]
             pred_np   = torch.sigmoid(out).cpu().numpy()
             target_np = target.cpu().numpy()
             vis_np    = vis_flags.cpu().numpy()
@@ -373,9 +459,11 @@ def evaluate_pe(model: "TrackNetV3", loader, device: str,
         per_game[g] = {"precision": g_prec, "recall": g_rec, "f1": g_f1,
                        "tp": s["tp"], "fp": s["fp"], "fn": s["fn"]}
 
+    vis_acc = vis_correct / max(vis_total, 1)
     return {"val_loss": avg_loss, "precision": prec, "recall": rec,
             "f1": f1, "margin": avg_margin,
             "tp": tp, "fp": fp, "fn": fn,
+            "vis_acc": vis_acc,
             "per_game": per_game}
 
 
@@ -386,7 +474,8 @@ def _wandb_prediction_samples(model, val_loader, device, n_samples=8):
     inp, target, _vis, _game = next(iter(val_loader))
     inp = inp.to(device)
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=(device != "cpu")):
-        pred = torch.sigmoid(model(inp)).cpu().numpy()
+        hmap_logits, _ = model(inp)
+        pred = torch.sigmoid(hmap_logits).cpu().numpy()
     target_np = target.numpy()
     for b in range(min(n_samples, inp.shape[0])):
         frame = (inp[b, 6:9].cpu().numpy().transpose(1, 2, 0) * 255).astype(np.uint8)
@@ -699,9 +788,16 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
     ckpt_path = out_path / "last_ckpt.pt"
     if resume and ckpt_path.exists():
         ckpt = torch.load(str(ckpt_path), map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
+        missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+        if missing:
+            print(f"  Resume: {len(missing)} new keys init from scratch "
+                  f"(e.g. vis_head — expected after architecture update)")
+        try:
+            optimizer.load_state_dict(ckpt["optimizer"])
+            scheduler.load_state_dict(ckpt["scheduler"])
+        except ValueError:
+            print("  Optimizer/scheduler state incompatible (architecture changed) "
+                  "— resetting optimizer, keeping model weights")
         scaler.load_state_dict(ckpt["scaler"])
         start_epoch = ckpt["epoch"] + 1
         best_f1     = ckpt.get("best_f1", 0.0)
@@ -751,13 +847,15 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
         train_loss = 0.0
         optimizer.zero_grad(set_to_none=True)
 
-        for batch_idx, (inp, target, _vis, _game) in enumerate(train_loader):
-            inp    = inp.to(device, non_blocking=True)
-            target = target.to(device, non_blocking=True)
+        for batch_idx, (inp, target, vis_flags, _game) in enumerate(train_loader):
+            inp       = inp.to(device, non_blocking=True)
+            target    = target.to(device, non_blocking=True)
+            vis_flags = vis_flags.to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                out  = model(inp)
-                loss = focal_loss(out, target) / accum_steps
+                hmap_out, vis_out = model(inp)
+                loss = (focal_loss(hmap_out, target)
+                        + VIS_LAMBDA * vis_bce_loss(vis_out, vis_flags)) / accum_steps
 
             scaler.scale(loss).backward()
 
@@ -787,6 +885,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                   f"val_loss(diag)={pe['val_loss']:.4f}  "
                   f"prec={pe['precision']:.3f}  rec={pe['recall']:.3f}  "
                   f"F1={pe['f1']:.3f}  margin={pe['margin']:.3f}  "
+                  f"vis_acc={pe['vis_acc']:.3f}  "
                   f"(TP={pe['tp']} FP={pe['fp']} FN={pe['fn']})")
             for g, gs in pe.get("per_game", {}).items():
                 print(f"  {g}: prec={gs['precision']:.3f} rec={gs['recall']:.3f} "
@@ -803,6 +902,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                     "val/tp": pe["tp"],
                     "val/fp": pe["fp"],
                     "val/fn": pe["fn"],
+                    "val/vis_acc": pe["vis_acc"],
                     "lr": scheduler.get_last_lr()[0],
                 }
                 for g, gs in pe.get("per_game", {}).items():
@@ -898,10 +998,12 @@ class TrackNetInference:
     DEFAULT_RADIUS = 15     # pixels in original frame, for bbox synthesis
 
     def __init__(self, weights_path: str, device: str = "cuda:0",
-                 conf_thresh: float = 0.5, ball_radius: int = 15):
+                 conf_thresh: float = 0.5, ball_radius: int = 15,
+                 vis_thresh: float = VIS_THRESH_INFER):
         self.device = device
         self.conf_thresh = conf_thresh
         self.ball_radius = ball_radius
+        self.vis_thresh = vis_thresh
         self._frame_buf: deque = deque(maxlen=3)
         self._frame_w: int = 0
         self._frame_h: int = 0
@@ -926,15 +1028,16 @@ class TrackNetInference:
         self.model.to(device)
         self.model.eval()
 
-    def predict(self, frame: np.ndarray) -> dict | None:
-        """Feed a frame and return a ball detection dict or None.
+    def predict(self, frame: np.ndarray) -> list:
+        """Feed a frame and return up to TN_TOPK ball detection candidates.
 
         Always call this for EVERY frame (including skipped ones) so the
         3-frame sliding window stays in sync with the video.
 
-        Returns:
-            {"tid": -1, "box": [x1,y1,x2,y2], "cls": 0, "conf": float}
-            or None if ball not detected / not enough frames buffered.
+        Returns a list of detection dicts (possibly empty). The first element
+        is the argmax; subsequent ones are NMS-suppressed runner-ups that
+        cleared TN_RUNNER_UP_CONF. Downstream (BallValidator._score) picks the
+        winner by confidence × trajectory alignment.
         """
         h, w = frame.shape[:2]
         self._frame_w = w
@@ -944,52 +1047,57 @@ class TrackNetInference:
         self._frame_buf.append(resized)
 
         if len(self._frame_buf) < 3:
-            return None
+            return []
 
-        # Build 11-channel input: 9 RGB + 2 motion diff maps (V4)
         frames = [f.astype(np.float32) / 255.0 for f in self._frame_buf]
-        f0 = np.transpose(frames[0], (2, 0, 1))     # (3, H, W) t-2
-        f1 = np.transpose(frames[1], (2, 0, 1))     # (3, H, W) t-1
-        f2 = np.transpose(frames[2], (2, 0, 1))     # (3, H, W) t
-        diff01 = np.abs(f1 - f0).mean(axis=0, keepdims=True)  # (1, H, W)
-        diff12 = np.abs(f2 - f1).mean(axis=0, keepdims=True)  # (1, H, W)
-        inp = np.concatenate([f0, f1, f2, diff01, diff12], axis=0)  # (11, H, W)
-        inp = np.expand_dims(inp, axis=0)            # (1, 11, H, W)
+        f0 = np.transpose(frames[0], (2, 0, 1))
+        f1 = np.transpose(frames[1], (2, 0, 1))
+        f2 = np.transpose(frames[2], (2, 0, 1))
+        diff01 = np.abs(f1 - f0).mean(axis=0, keepdims=True)
+        diff12 = np.abs(f2 - f1).mean(axis=0, keepdims=True)
+        inp = np.concatenate([f0, f1, f2, diff01, diff12], axis=0)
+        inp = np.expand_dims(inp, axis=0)
         tensor = torch.from_numpy(inp).to(self.device)
 
-        # TTA: average original + horizontally-flipped heatmaps.
-        # Flip along the width axis (dim=-1), run both through the model,
-        # then flip the second prediction back before averaging.
-        tensor_flip = torch.flip(tensor, dims=[-1])
+        # Single forward pass — TTA (flip average) costs ~15ms/frame for
+        # negligible F1 gain given TrackNet's 3-frame temporal context already
+        # handles most flip ambiguity.
         with torch.no_grad(), torch.amp.autocast(
                 "cuda", enabled=self.device != "cpu"):
-            out_orig = torch.sigmoid(self.model(tensor))       # (1,1,H,W)
-            out_flip = torch.sigmoid(self.model(tensor_flip))  # (1,1,H,W)
-        out_flip_back = torch.flip(out_flip, dims=[-1])
-        heatmap = ((out_orig + out_flip_back) / 2.0)[0].cpu().numpy()  # (1,H,W)
+            hmap_logits, vis_logit = self.model(tensor)
+            out = torch.sigmoid(hmap_logits)
+
+        # Visibility gate: if the head is confident there's no ball, skip
+        # candidate extraction entirely — suppresses FP on occluded frames.
+        vis_prob = float(torch.sigmoid(vis_logit).squeeze())
+        if vis_prob < self.vis_thresh:
+            return []
+
+        heatmap = out[0].cpu().numpy()
 
         scale_x = w / INPUT_W
         scale_y = h / INPUT_H
 
-        cx, cy, conf = postprocess_heatmap(heatmap, scale_x, scale_y)
-
-        if cx is None or conf < self.conf_thresh:
-            return None
-
+        candidates = postprocess_heatmap(heatmap, scale_x, scale_y,
+                                         motion_map=diff12)
         r = self.ball_radius
-        box = [
-            max(0, int(cx - r)),
-            max(0, int(cy - r)),
-            min(w, int(cx + r)),
-            min(h, int(cy + r)),
-        ]
-
-        return {
-            "tid": -1,
-            "box": box,
-            "cls": self.CLS_BALL,
-            "conf": conf,
-        }
+        dets: list = []
+        for cx, cy, conf in candidates:
+            if conf < self.conf_thresh:
+                continue
+            box = [
+                max(0, int(cx - r)),
+                max(0, int(cy - r)),
+                min(w, int(cx + r)),
+                min(h, int(cy + r)),
+            ]
+            dets.append({
+                "tid": -1,
+                "box": box,
+                "cls": self.CLS_BALL,
+                "conf": conf,
+            })
+        return dets
 
     def reset(self):
         """Clear the frame buffer (e.g. when switching videos)."""

@@ -80,11 +80,15 @@ def predict_triplet(model, f0, f1, f2, device):
     tensor = torch.from_numpy(inp).unsqueeze(0).to(device)
 
     with torch.no_grad(), torch.amp.autocast("cuda", enabled=device != "cpu"):
-        out = torch.sigmoid(model(tensor))
+        hmap_logits, _ = model(tensor)
+        out = torch.sigmoid(hmap_logits)
     heatmap = out[0].cpu().numpy()  # (1, H, W)
 
-    cx, cy, conf = postprocess_heatmap(heatmap)
-    if cx is None or conf < CONF_THRESH:
+    candidates = postprocess_heatmap(heatmap)
+    if not candidates:
+        return None
+    cx, cy, conf = candidates[0]
+    if conf < CONF_THRESH:
         return None
     return cx, cy, conf
 
