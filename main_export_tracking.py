@@ -15,7 +15,7 @@ import math
 import re
 import shutil
 import time
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 
 import cv2
@@ -72,7 +72,7 @@ VEL_HISTORY_LEN    = 15
 VEL_EXIT_THRESH    = 80
 
 # TrackNet — heatmap-based ball detection using 3 consecutive frames
-TRACKNET_WEIGHTS     = "runs/tracknet/weights/best_overall.pt"  # best across all training sessions
+TRACKNET_WEIGHTS     = "runs/tracknet/weights/best.pt"  # path to trained TrackNet weights
 TRACKNET_CONF_THRESH = 0.5                        # heatmap peak confidence threshold (lower for early training)
 TRACKNET_BALL_RADIUS = 15                          # pixels, for bbox synthesis from center point
 
@@ -362,20 +362,63 @@ class JerseyOCR:
 
 
 # ---------------------------------------------------------------------------
-# Team Classification — K-means on jersey color histograms
+# Team Classification — dominant jersey color + K-means (k=2)
+# ---------------------------------------------------------------------------
+#
+# For each player, we crop the chest region and find the DOMINANT (majority)
+# color by quantizing the pixels into hue-saturation bins and picking the
+# most-populated bin.  This avoids mean/masking approaches that fail when
+# jersey colors overlap with skin (orange) or are very dark (navy).
+#
+# The dominant color feature is (H_bin_center, S_bin_center) — 2-D.
+# K-means (k=2) on these features separates the two teams.
+#
+# Per-player rolling vote window prevents early misclassifications from
+# sticking: every frame adds a vote, get_team() returns the majority.
+#
 # ---------------------------------------------------------------------------
 
-TEAM_SAMPLE_COUNT = 100   # player crops to collect before clustering
+TEAM_SAMPLE_COUNT   = 30   # samples to reach the stable final cluster
+TEAM_EARLY_CLUSTER  = 12   # samples to fire the early rough cluster
+TEAM_MAX_PER_PLAYER = 5    # cap samples from the same track during collection
+TEAM_VOTE_WINDOW    = 15   # per-player rolling window size for majority voting
+
+# Hue/saturation quantization: 18 hue bins × 5 saturation bins
+_H_BINS = 18    # 10° each (0-170)
+_S_BINS = 5     # 51 wide each (0-255)
+
 TEAM_COLORS = [(255, 140, 0), (0, 180, 255)]  # BGR: orange (team A), cyan (team B)
 
+
 class TeamClassifier:
-    """Auto-detect two teams from jersey colors using K-means clustering."""
+    """Two-team classifier using dominant jersey color + K-means (k=2).
+
+    Feature extraction:
+      1. Crop the chest area of the player bounding box.
+      2. Remove only very dark (shadow) and very bright (glare/white-line)
+         pixels — NO skin or floor masking, which was incorrectly removing
+         orange jerseys (same hue as skin) and navy jerseys (dark).
+      3. Quantize remaining pixels into an 18×5 hue-saturation histogram.
+      4. The (H, S) bin center with the most pixels is the dominant jersey
+         color.  Using the mode rather than mean is robust to mixed crops
+         (background, numbers, exposed skin) because they don't dominate.
+
+    Classification:
+      - K-means (k=2) on the 2-D (H_center, S_center) feature vectors.
+      - Per-player deque vote buffer: every frame adds a vote, majority wins.
+      - classify() is safe to call every frame — cheap and self-correcting.
+    """
 
     def __init__(self):
-        self._samples: list  = []     # list of (tid, color_hist)
-        self._labels:  dict  = {}     # tid → 0 or 1 (team index)
-        self._centers         = None  # K-means cluster centers
-        self._ready           = False
+        self._samples:      list            = []   # [(tid, feature), ...]
+        self._labels:       dict[int, int]  = {}   # tid → majority-voted team
+        self._vote_buffers: dict            = {}   # tid → deque of raw labels
+        self._centers:      np.ndarray | None = None
+        self._ready                         = False
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
     def is_ready(self) -> bool:
         return self._ready
@@ -385,86 +428,167 @@ class TeamClassifier:
 
     def get_team_color(self, tid: int):
         team = self._labels.get(tid)
-        if team is not None:
-            return TEAM_COLORS[team]
-        return None
+        return TEAM_COLORS[team] if team is not None else None
 
-    def collect(self, frame: np.ndarray, detections: list):
-        """Collect upper-torso color histograms from player detections."""
-        if self._ready:
+    def collect(self, frame: np.ndarray, detections: list,
+                pose_map: dict | None = None):
+        """Gather dominant-color samples; fire early/final K-means clusters."""
+        if len(self._samples) >= TEAM_SAMPLE_COUNT and self._ready:
             return
         for d in detections:
             tid = d["tid"]
-            if any(s[0] == tid for s in self._samples):
-                continue  # already sampled this tid
-            box = d["box"]
-            x1, y1, x2, y2 = box
-            h = y2 - y1
-            w = x2 - x1
-            # Crop upper-middle torso (avoid arms, head)
-            crop_y1 = y1 + int(h * 0.15)
-            crop_y2 = y1 + int(h * 0.55)
-            crop_x1 = x1 + int(w * 0.20)
-            crop_x2 = x2 - int(w * 0.20)
-            if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+            if sum(1 for s in self._samples if s[0] == tid) >= TEAM_MAX_PER_PLAYER:
                 continue
-            crop = frame[max(0, crop_y1):crop_y2, max(0, crop_x1):crop_x2]
-            if crop.size == 0:
+            kps = pose_map.get(tid) if pose_map else None
+            feat = self._dominant_color(frame, d["box"], kps)
+            if feat is None:
                 continue
-            hist = self._color_hist(crop)
-            self._samples.append((tid, hist))
+            self._samples.append((tid, feat))
 
-        if len(self._samples) >= TEAM_SAMPLE_COUNT:
-            self._cluster()
+        n = len(self._samples)
+        if not self._ready and n >= TEAM_EARLY_CLUSTER:
+            self._cluster("early")
+        elif self._ready and n >= TEAM_SAMPLE_COUNT:
+            self._cluster("final")
 
-    def _color_hist(self, crop: np.ndarray) -> np.ndarray:
-        """Compute a normalized HSV hue+saturation histogram."""
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        # 16 hue bins, 8 saturation bins = 128-dim feature
-        hist = cv2.calcHist([hsv], [0, 1], None, [16, 8],
-                            [0, 180, 0, 256])
-        cv2.normalize(hist, hist)
-        return hist.flatten()
+    def classify(self, frame: np.ndarray, det: dict,
+                 pose_map: dict | None = None) -> int | None:
+        """Classify a player detection; update its rolling vote buffer.
 
-    def _cluster(self):
-        """Run K-means (k=2) on collected histograms."""
-        data = np.array([s[1] for s in self._samples], dtype=np.float32)
-        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-                    100, 0.2)
-        _, labels, centers = cv2.kmeans(data, 2, None, criteria, 10,
-                                        cv2.KMEANS_PP_CENTERS)
-        self._centers = centers
-        for i, (tid, _) in enumerate(self._samples):
-            self._labels[tid] = int(labels[i][0])
-        self._ready = True
-        print(f"  Team classifier ready ({len(self._samples)} samples, 2 clusters)")
-
-    def classify(self, frame: np.ndarray, det: dict) -> int | None:
-        """Classify a new player detection into team 0 or 1."""
+        Safe to call every frame — adds one vote and returns majority label.
+        """
         if not self._ready or self._centers is None:
             return None
-        tid = det["tid"]
-        if tid in self._labels:
-            return self._labels[tid]
-        box = det["box"]
+        kps = pose_map.get(det["tid"]) if pose_map else None
+        feat = self._dominant_color(frame, det["box"], kps)
+        if feat is None:
+            return self._labels.get(det["tid"])
+        dists = [np.linalg.norm(feat - c) for c in self._centers]
+        raw   = int(np.argmin(dists))
+        return self._record_vote(det["tid"], raw)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _dominant_color(self, frame: np.ndarray, box: list,
+                        kps: tuple | None = None) -> np.ndarray | None:
+        """Return the (H_center, S_center) of the dominant hue-sat bin.
+
+        Crop priority:
+          1. Pose-based: shoulders (KP 5,6) → hips (KP 11,12) with small inset.
+             This is the most accurate — just the jersey torso, no arms, no shorts.
+          2. Box-based fallback: fixed percentages of the bounding box.
+        """
+        fh, fw = frame.shape[:2]
+
+        # --- Attempt pose-based crop ---
+        if kps is not None:
+            kps_xy, kps_conf = kps
+            # COCO-17: 5=L-shoulder, 6=R-shoulder, 11=L-hip, 12=R-hip
+            pts = {i: (kps_xy[i], kps_conf[i])
+                   for i in (5, 6, 11, 12)
+                   if i < len(kps_xy)}
+            visible = {i for i, (_, c) in pts.items() if c >= KP_CONF_THRESH
+                       and kps_xy[i][0] > 0 and kps_xy[i][1] > 0}
+
+            if {5, 6, 11, 12}.issubset(visible):
+                # All four anchor points are confident — use them directly
+                sx = [kps_xy[i][0] for i in (5, 6)]
+                sy = [kps_xy[i][1] for i in (5, 6)]
+                hx = [kps_xy[i][0] for i in (11, 12)]
+                hy = [kps_xy[i][1] for i in (11, 12)]
+                pad_x = int(abs(sx[0] - sx[1]) * 0.10)   # 10% inset from shoulders
+                pad_y = int(abs(sy[0] + sy[1]) * 0.02)
+                cx1 = max(0,  int(min(sx)) + pad_x)
+                cx2 = min(fw, int(max(sx)) - pad_x)
+                cy1 = max(0,  int(min(sy)) + pad_y)
+                cy2 = min(fh, int((hy[0] + hy[1]) / 2) - pad_y)
+                if cx2 > cx1 + 8 and cy2 > cy1 + 8:
+                    crop = frame[cy1:cy2, cx1:cx2]
+                    feat = self._color_feature(crop)
+                    if feat is not None:
+                        return feat
+
+            elif {5, 6}.issubset(visible):
+                # Have shoulders but not hips — crop from shoulders down ~45% of box
+                x1, y1, x2, y2 = box
+                sx = [kps_xy[i][0] for i in (5, 6)]
+                sy = [kps_xy[i][1] for i in (5, 6)]
+                pad_x = int(abs(sx[0] - sx[1]) * 0.10)
+                cx1 = max(0,  int(min(sx)) + pad_x)
+                cx2 = min(fw, int(max(sx)) - pad_x)
+                cy1 = max(0,  int(min(sy)))
+                cy2 = min(fh, int(min(sy)) + int((y2 - y1) * 0.45))
+                if cx2 > cx1 + 8 and cy2 > cy1 + 8:
+                    crop = frame[cy1:cy2, cx1:cx2]
+                    feat = self._color_feature(crop)
+                    if feat is not None:
+                        return feat
+
+        # --- Box-based fallback ---
         x1, y1, x2, y2 = box
-        h = y2 - y1
-        w = x2 - x1
-        crop_y1 = y1 + int(h * 0.15)
-        crop_y2 = y1 + int(h * 0.55)
-        crop_x1 = x1 + int(w * 0.20)
-        crop_x2 = x2 - int(w * 0.20)
-        if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+        bh, bw = y2 - y1, x2 - x1
+        cy1 = max(0,  y1 + int(bh * 0.22))
+        cy2 = min(fh, y1 + int(bh * 0.58))
+        cx1 = max(0,  x1 + int(bw * 0.15))
+        cx2 = min(fw, x2 - int(bw * 0.15))
+        if cx2 <= cx1 + 4 or cy2 <= cy1 + 4:
             return None
-        crop = frame[max(0, crop_y1):crop_y2, max(0, crop_x1):crop_x2]
-        if crop.size == 0:
+        return self._color_feature(frame[cy1:cy2, cx1:cx2])
+
+    def _color_feature(self, crop: np.ndarray) -> np.ndarray | None:
+        """Dominant (H, S) bin from a jersey crop image."""
+        if crop is None or crop.size == 0:
             return None
-        hist = self._color_hist(crop)
-        # Assign to nearest cluster center
-        dists = [np.linalg.norm(hist - c) for c in self._centers]
-        team = int(np.argmin(dists))
-        self._labels[tid] = team
-        return team
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        H = hsv[:, :, 0].flatten().astype(np.int32)
+        S = hsv[:, :, 1].flatten().astype(np.int32)
+        V = hsv[:, :, 2].flatten().astype(np.int32)
+
+        # Drop only extreme glare and near-black — no jersey-color masking
+        keep = (V >= 20) & (V <= 245)
+        H, S = H[keep], S[keep]
+        if len(H) < 25:
+            return None
+
+        # 18 hue × 5 saturation bins → pick the most populated cell
+        H_bin = np.clip(H // 10, 0, _H_BINS - 1)
+        S_bin = np.clip(S // 51, 0, _S_BINS - 1)
+        counts = np.bincount(H_bin * _S_BINS + S_bin,
+                             minlength=_H_BINS * _S_BINS)
+        best  = int(counts.argmax())
+        dom_H = (best // _S_BINS) * 10 + 5
+        dom_S = (best  % _S_BINS) * 51 + 25
+        return np.array([dom_H, dom_S], dtype=np.float32)
+
+    def _cluster(self, label: str = ""):
+        """K-means (k=2) on dominant-color features; update all labels."""
+        data = np.array([s[1] for s in self._samples], dtype=np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+        _, km_labels, centers = cv2.kmeans(
+            data, 2, None, criteria, 10, cv2.KMEANS_PP_CENTERS
+        )
+        self._centers = centers
+        for i, (tid, _) in enumerate(self._samples):
+            self._record_vote(tid, int(km_labels[i][0]))
+        self._ready = True
+        tag = f" [{label}]" if label else ""
+        # Print cluster centres so it's easy to verify the two teams were found
+        c0_h, c0_s = centers[0]
+        c1_h, c1_s = centers[1]
+        print(f"  Team classifier ready{tag} — "
+              f"cluster 0: H={c0_h:.0f} S={c0_s:.0f}  |  "
+              f"cluster 1: H={c1_h:.0f} S={c1_s:.0f}  "
+              f"({len(self._samples)} samples)")
+
+    def _record_vote(self, tid: int, raw_label: int) -> int:
+        """Add one vote and return the current majority label for tid."""
+        buf = self._vote_buffers.setdefault(tid, deque(maxlen=TEAM_VOTE_WINDOW))
+        buf.append(raw_label)
+        voted = Counter(buf).most_common(1)[0][0]
+        self._labels[tid] = voted
+        return voted
 
 
 # ---------------------------------------------------------------------------
@@ -1089,31 +1213,6 @@ def draw_ball(frame, box, label="BALL"):
     _label_bg(frame, x1, y1 - 3, label, C_BALL)
 
 
-# ---------------------------------------------------------------------------
-# Helper: Draw dashed arrow from ball to hoop
-# ---------------------------------------------------------------------------
-def draw_dashed_arrow(frame, pt1, pt2, color=(255,255,255), thickness=2, dash_length=10):
-    """Draw a dashed line with arrow from pt1 to pt2."""
-    x1, y1 = pt1
-    x2, y2 = pt2
-    dist = math.hypot(x2 - x1, y2 - y1)
-    if dist == 0:
-        return
-    dx = (x2 - x1) / dist
-    dy = (y2 - y1) / dist
-
-    num_dashes = int(dist // dash_length)
-    for i in range(0, num_dashes, 2):
-        start_x = int(x1 + dx * dash_length * i)
-        start_y = int(y1 + dy * dash_length * i)
-        end_x   = int(x1 + dx * dash_length * (i + 1))
-        end_y   = int(y1 + dy * dash_length * (i + 1))
-        cv2.line(frame, (start_x, start_y), (end_x, end_y), color, thickness)
-
-    # Arrow head
-    cv2.arrowedLine(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness, tipLength=0.2)
-
-
 
 def draw_hoop(frame, box):
     x1, y1, x2, y2 = map(int, box)
@@ -1321,7 +1420,8 @@ def _load_model(pt_path: str, imgsz: int, label: str) -> YOLO:
 @torch.inference_mode()
 def run(video_path: str, out_dir: str, weights: str | None = None,
         use_tracknet: bool = True,
-        tracknet_weights: str | None = None):
+        tracknet_weights: str | None = None,
+        tracking_out: str | None = None):
     Path(out_dir).mkdir(parents=True, exist_ok=True)
 
     cap = cv2.VideoCapture(video_path)
@@ -1335,10 +1435,20 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
     print(f"Video: {video_path}  |  {frame_w}x{frame_h}  "
           f"|  {fps:.1f} fps  |  {total_frames} frames")
 
+    tracking_data = {
+        "video": video_path, "fps": fps,
+        "frame_width": frame_w, "frame_height": frame_h,
+        "total_frames": total_frames,
+        "frames": {},
+    } if tracking_out else None
+
     device = get_device()
     if device.startswith("cuda"):
         infer_imgsz = 1280
         use_half    = True
+    elif device == "mps":
+        infer_imgsz = 1280
+        use_half    = False   # MPS does not support float16
     else:
         infer_imgsz = 640
         use_half    = False
@@ -1535,6 +1645,23 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         ball_dets    = ball_validator.filter(frame_idx, ball_dets, hoop_dets)
         ball_to_draw = ball_tracker.update(frame_idx, ball_dets)
 
+        # ---- 5b. Export tracking snapshot ------------------------------------
+        if tracking_data is not None:
+            def _cx(box): return int((box[0] + box[2]) / 2)
+            def _cy(box): return int((box[1] + box[3]) / 2)
+            ball_box = ball_to_draw[0]["box"] if ball_to_draw else None
+            tracking_data["frames"][str(frame_idx)] = {
+                "ball": {"center": [_cx(ball_box), _cy(ball_box)], "box": ball_box}
+                        if ball_box else None,
+                "hoops": [{"center": [_cx(h["box"]), _cy(h["box"])], "box": h["box"]}
+                          for h in hoop_dets],
+                "players": [{"tid": d["tid"],
+                             "center": [_cx(d["box"]), _cy(d["box"])],
+                             "box": d["box"],
+                             "team": team_clf.get_team(d["tid"])}
+                            for d in real_dets],
+            }
+
         # ---- 6. Draw hoop / ref / players (everything except ball) ------------
         for det in hoop_dets:
             draw_hoop(frame, det["box"])
@@ -1544,16 +1671,15 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
 
         # Collect team color samples (before classifier is ready)
         if not team_clf.is_ready():
-            team_clf.collect(frame, real_dets)
+            team_clf.collect(frame, real_dets, pose_map)
 
         for d in real_dets:
             tid = d["tid"]
             jersey = jersey_ocr.get_jersey(tid)
             label = f"#{jersey}" if jersey else f"#{tid}"
+            if team_clf.is_ready():
+                team_clf.classify(frame, d, pose_map)   # updates vote buffer every frame
             team_color = team_clf.get_team_color(tid)
-            if team_color is None and team_clf.is_ready():
-                team_clf.classify(frame, d)
-                team_color = team_clf.get_team_color(tid)
             draw_player(frame, d["box"], label, color=team_color)
             if tid in pose_map:
                 draw_skeleton(frame, *pose_map[tid])
@@ -1576,14 +1702,6 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
         for fin_frame, fin_ball_box, fin_label in ball_interp.pop_ready():
             if fin_ball_box is not None:
                 draw_ball(fin_frame, fin_ball_box, label=fin_label or "BALL (INTERP)")
-                # Draw projected dashed arrow from ball to hoop
-                if cached_hoop_dets:
-                    hbox = cached_hoop_dets[0]["box"]
-                    hx = int((hbox[0] + hbox[2]) / 2)
-                    hy = int((hbox[1] + hbox[3]) / 2)
-                    bx = int((fin_ball_box[0] + fin_ball_box[2]) / 2)
-                    by = int((fin_ball_box[1] + fin_ball_box[3]) / 2)
-                    draw_dashed_arrow(fin_frame, (bx, by), (hx, hy), color=(255,255,255), thickness=2)
             out_video.write(fin_frame)
 
         frame_idx += 1
@@ -1602,14 +1720,6 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
     for fin_frame, fin_ball_box, fin_label in ball_interp.flush():
         if fin_ball_box is not None:
             draw_ball(fin_frame, fin_ball_box, label=fin_label or "BALL (INTERP)")
-            # Draw projected dashed arrow from ball to hoop
-            if cached_hoop_dets:
-                hbox = cached_hoop_dets[0]["box"]
-                hx = int((hbox[0] + hbox[2]) / 2)
-                hy = int((hbox[1] + hbox[3]) / 2)
-                bx = int((fin_ball_box[0] + fin_ball_box[2]) / 2)
-                by = int((fin_ball_box[1] + fin_ball_box[3]) / 2)
-                draw_dashed_arrow(fin_frame, (bx, by), (hx, hy), color=(255,255,255), thickness=2)
         out_video.write(fin_frame)
 
     cap.release()
@@ -1617,6 +1727,13 @@ def run(video_path: str, out_dir: str, weights: str | None = None,
     print(f"\nDone — {frame_idx} frames processed.")
     print(f"  Annotated video : {Path(out_dir) / 'annotated.mp4'}")
     print(f"  Jersey numbers found: {dict(jersey_ocr._confirmed)}")
+
+    if tracking_data is not None and tracking_out:
+        import json
+        Path(tracking_out).parent.mkdir(parents=True, exist_ok=True)
+        with open(tracking_out, "w") as f:
+            json.dump(tracking_data, f)
+        print(f"  Tracking data   : {tracking_out}")
 
 
 # ---------------------------------------------------------------------------
@@ -1642,11 +1759,14 @@ if __name__ == "__main__":
                         help="TrackNet label directory (default: auto-converts YOLO labels)")
     parser.add_argument("--export-tensorrt", action="store_true",
                         help="Export all models to TensorRT .engine format (run once per GPU)")
+    parser.add_argument("--export-tracking", default=None, metavar="PATH",
+                        help="Save per-frame tracking data to JSON (for minimap.py / event_detector.py)")
     args = parser.parse_args()
 
     run_kwargs = dict(
         use_tracknet=not args.no_tracknet,
         tracknet_weights=args.tracknet_weights,
+        tracking_out=args.export_tracking,
     )
 
     if args.export_tensorrt:
@@ -1670,3 +1790,43 @@ if __name__ == "__main__":
         run(args.video, args.out, weights=best_pt, **run_kwargs)
     else:
         run(args.video, args.out, weights=args.weights, **run_kwargs)
+
+    # --- Post-processing: shot + board crash detection ---
+    # Runs automatically after inference if tracking was exported.
+    if args.export_tracking and Path(args.export_tracking).exists():
+        print("\n--- Running shot + board crash detection ---")
+        from detect_shots_crashes import (
+            load_tracking, build_ball_trajectory, find_shots,
+            detect_board_crashes, render_video as render_shots_video,
+            export_csv as export_shots_csv,
+        )
+        sc_data   = load_tracking(args.export_tracking)
+        sc_fps    = sc_data["fps"]
+        sc_frames = sc_data["frames"]
+
+        sc_traj  = build_ball_trajectory(sc_frames)
+        sc_shots = find_shots(sc_traj)
+        detect_board_crashes(sc_shots, sc_frames)
+
+        print(f"Shots detected: {len(sc_shots)}")
+        for i, s in enumerate(sc_shots, 1):
+            t       = s["peak_frame"] / sc_fps
+            crashes = s.get("crashes", {})
+            t1      = len(crashes.get("team_0", []))
+            t2      = len(crashes.get("team_1", []))
+            uk      = len(crashes.get("unknown", []))
+            print(f"  Shot {i}: frame {s['peak_frame']} ({t:.2f}s)  "
+                  f"crashes -> Team1={t1}  Team2={t2}  unknown={uk}")
+
+        out_dir = Path(args.out)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        csv_path   = str(out_dir / "shots_crashes.csv")
+        video_path = str(out_dir / "shots_crashes_annotated.mp4")
+        export_shots_csv(sc_shots, csv_path, sc_fps)
+
+        video_src = args.video or sc_data.get("video")
+        if video_src and Path(video_src).exists():
+            render_shots_video(video_src, video_path, sc_frames, sc_shots, sc_fps)
+        else:
+            print(f"Video source not found ({video_src}), skipping crash video export.")
