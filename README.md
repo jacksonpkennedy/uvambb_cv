@@ -4,6 +4,8 @@
 
 A basketball analysis pipeline that detects, tracks, and annotates players, referees, the basketball, and the hoop from game footage using a fine-tuned YOLO11s model with ByteTrack multi-object tracking, TrackNet heatmap-based ball detection with test-time augmentation, Kalman-filtered ball trajectory smoothing, pose estimation, jersey number OCR, temporal interpolation with outlier rejection, and automatic team classification.
 
+![Example from test footage](screenshotuvambb.png)
+
 **Team Members:**
 - Jackson Kennedy
 - Nathan Wan

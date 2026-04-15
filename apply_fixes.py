@@ -177,8 +177,8 @@ def main():
     parser.add_argument("--disagreements", default="output/disagreements")
     parser.add_argument("--fix-positions", action="store_true")
     parser.add_argument("--add-missed", action="store_true")
-    parser.add_argument("--min-dist", type=float, default=20.0)
-    parser.add_argument("--min-conf", type=float, default=0.7)
+    parser.add_argument("--min-dist", type=float, default=15.0)
+    parser.add_argument("--min-conf", type=float, default=0.5)
     parser.add_argument("--max-fp-frame", type=int, default=None,
                         help="Only apply false-positive removal to stems with "
                              "frame number <= this (for partial FP review)")

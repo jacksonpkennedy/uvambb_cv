@@ -94,7 +94,7 @@ def main():
             writer.writerows(rows)
         vis = sum(1 for r in rows if r["visibility"] == "1")
         print(f"  [{split}] {len(rows)} rows, {vis} visible "
-              f"({vis / max(len(rows), 1) * 100:.1f}%) → {out_path}")
+              f"({vis / max(len(rows), 1) * 100:.1f}%) -> {out_path}")
 
     total = len(train_rows) + len(val_rows)
     print(f"\nTotal: {total} rows across {len(games)} games.")

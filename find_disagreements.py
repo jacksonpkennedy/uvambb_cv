@@ -108,8 +108,17 @@ def find_disagreements(data_dir: str, weights: str, visualize: bool = False,
 
     out_dir = Path("output/disagreements")
     if visualize:
+        import shutil
         for sub in ("false_negatives", "false_positives", "position_mismatch"):
-            (out_dir / sub).mkdir(parents=True, exist_ok=True)
+            sub_dir = out_dir / sub
+            if sub_dir.exists():
+                for child in sub_dir.iterdir():
+                    if child.is_dir() and child.name != "_neither":
+                        try:
+                            shutil.rmtree(child)
+                        except PermissionError:
+                            print(f"  [warn] Could not delete {child} — close any open Explorer/viewer windows and retry")
+            sub_dir.mkdir(parents=True, exist_ok=True)
 
     for split in ("train", "val"):
         csv_path = Path(data_dir) / f"{split}.csv"
@@ -317,7 +326,7 @@ if __name__ == "__main__":
                         help="Root directory for frame data (or set UVAMBB_DATA_ROOT in .env)")
     parser.add_argument("--visualize", action="store_true",
                         help="Save annotated images of disagreements")
-    parser.add_argument("--max-vis", type=int, default=1000,
+    parser.add_argument("--max-vis", type=int, default=2000,
                         help="Max visualizations per category")
     args = parser.parse_args()
 
@@ -349,6 +358,13 @@ ITERATION WORKFLOW
 
    Note: adding raw auto-labeled frames temporarily drops F1 because they
    carry noise. Steps 2-5 win it back.
+
+Remove-Item output\disagreements\false_negatives\game_*\* -Force
+Remove-Item output\disagreements\false_positives\game_*\* -Force
+Remove-Item output\disagreements\position_mismatch\game_*\* -Force
+Remove-Item output\disagreements\false_negatives\game_* -Force
+Remove-Item output\disagreements\false_positives\game_* -Force
+Remove-Item output\disagreements\position_mismatch\game_* -Force
 
 2) RUN AUDIT
    python find_disagreements.py --visualize --max-vis 2000
@@ -470,7 +486,7 @@ ITERATION WORKFLOW
       data/tracknet_merged/backups/<YYYYMMDD_HHMMSS>_zero_neither/
 
 6) RETRAIN
-   python tracknet.py --train --epochs 100 --batch 8
+   python tracknet.py --train --epochs 40 --batch 8
 
    The .npy preprocessing cache does NOT need regeneration — it stores
    resized frames, not labels. Label changes take effect next epoch.
