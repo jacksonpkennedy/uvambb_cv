@@ -50,6 +50,16 @@ TN_TOPK = 3
 TN_NMS_RADIUS = 20        # model-space pixels suppressed around each peak
 TN_RUNNER_UP_CONF = 0.30  # runner-ups must clear this to be returned
 
+# Motion-streak candidate extraction — fast ball detection
+# A basketball moving at high speed creates an elongated streak in the diff map.
+# Aspect ratio distinguishes a streak (ball) from a blob (shoe, logo, hand).
+TN_STREAK_MIN_ASPECT  = 2.0   # min long/short side ratio to count as a streak
+TN_STREAK_MIN_AREA    = 40    # min px area at model res (avoids noise specs)
+TN_STREAK_MAX_AREA    = 600   # max px area (larger = player limb, not ball)
+TN_STREAK_MIN_INTENS  = 0.12  # min mean diff intensity to suppress static noise
+TN_STREAK_CONF        = 0.45  # pseudo-confidence assigned to streak candidates
+                               # (lower than heatmap peak; validator scores by trajectory)
+
 # Visibility classification head
 VIS_LAMBDA = 0.1          # weight of vis BCE loss relative to heatmap focal loss
                           # Keep low so heatmap training dominates while vis_head bootstraps
