@@ -198,7 +198,10 @@ class TrackNetV3(nn.Module):
         # (0.01 or 0.99) that Kaiming init produces, avoiding massive initial
         # loss from the (pred^2 * log(1-pred)) term on background pixels.
         nn.init.normal_(self.conv18.weight, mean=0, std=0.001)
-        nn.init.constant_(self.conv18.bias, -2.0)  # sigmoid(-2)=0.12, conservative no-ball prior
+        nn.init.constant_(self.conv18.bias, -0.5)  # sigmoid(-0.5)=0.38, mild no-ball prior
+        # (was -2.0 when data was ~50/50 visible/empty; now 77% visible after
+        # cleaning 10K+ false negatives — a strong negative prior fights the
+        # gradient for too many early epochs)
 
 
 # ---------------------------------------------------------------------------
@@ -853,16 +856,29 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
     # AdamW: decoupled weight decay generalises better than L2 in Adam
     # (Loshchilov & Hutter 2019), especially with cosine schedulers.
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4,
-                                  weight_decay=5e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(epochs // 2, 10), eta_min=1e-6)
+                                  weight_decay=1e-4)
+    # lr 2e-4→1e-4: empirically best run used 1e-4 (F1=0.524). 2e-4 overshoots
+    # on the small ball heatmap task.
+    # wd 5e-4→1e-4: lower weight decay lets the model fit clean labels better;
+    # heavy regularization was compensating for label noise that no longer exists.
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=10, T_mult=2, eta_min=1e-6)
+    # CosineAnnealingWarmRestarts: LR restarts at epoch 10, then 30, then 70...
+    # Each cycle is T_mult=2x longer than the last.
+    # Why: CosineAnnealingLR decayed to near-zero by epoch 21 in the best prior
+    # run, causing F1 to plateau then decline — the model ran out of useful LR.
+    # Warm restarts give a fresh exploratory phase after each cycle so the model
+    # keeps improving on newly cleaned data rather than freezing in place.
 
     use_amp = device != "cpu"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     best_f1        = 0.0
     no_improve     = 0       # epochs since best F1 improved
-    early_stop_pat = 8
+    early_stop_pat = 15
+    # 15 (was 12): warm restarts cause a brief F1 dip when LR spikes at the
+    # start of each new cycle. Patience must exceed the recovery time (~3-5
+    # epochs) to avoid stopping in the middle of a promising restart.
     start_epoch    = 0
 
     # Load best-ever F1 for overall tracking

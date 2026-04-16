@@ -407,7 +407,7 @@ ITERATION WORKFLOW
      ESC / N       Cancel, back to review
 
    Category semantics:
-     false_negatives  A=add label  R=skip(model wrong)  K=skip
+     false_negatives  A=add label (there is a ball) R or K=skip (no ball)p
      false_positives  A/R=remove bad label  K=keep(real ball)
      position_mismatch  A=reposition  R=zero(neither)  K=keep label
 
