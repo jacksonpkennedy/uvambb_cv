@@ -299,7 +299,90 @@ def postprocess_heatmap(heatmap: np.ndarray,
 
         threshold = TN_RUNNER_UP_CONF
 
+    # --- Motion-streak candidates ---
+    # Fast-moving balls create elongated blobs in the diff map. Use connected
+    # component analysis on the diff map to find them and add as candidates
+    # if they pass aspect-ratio / area / intensity filters. This fires only
+    # when the ball moves too fast for the heatmap to produce a strong peak.
+    if motion_map is not None:
+        streak_candidates = _find_motion_streaks(motion_map, scale_x, scale_y)
+        for (sx, sy, sconf) in streak_candidates:
+            # Deduplicate: skip if within NMS radius of an existing candidate
+            too_close = False
+            for (cx, cy, _) in candidates:
+                dist = math.hypot(sx / scale_x - cx / scale_x,
+                                  sy / scale_y - cy / scale_y)
+                if dist < TN_NMS_RADIUS:
+                    too_close = True
+                    break
+            if not too_close and len(candidates) < TN_TOPK:
+                candidates.append((sx, sy, sconf))
+
     return candidates
+
+
+def _find_motion_streaks(motion_map: np.ndarray,
+                         scale_x: float = 1.0,
+                         scale_y: float = 1.0) -> list:
+    """Find elongated motion-streak candidates in the diff map.
+
+    Returns a list of (x, y, conf) tuples (at output coordinate scale).
+    Empty list if no qualifying streaks found.
+    """
+    m = motion_map[0] if motion_map.ndim == 3 else motion_map
+    m = m.reshape(INPUT_H, INPUT_W).astype(np.float32)
+
+    # Normalise to [0, 1] using a robust 99th-percentile cap so a single bright
+    # pixel doesn't collapse everything else to near-zero.
+    m_hi = float(np.percentile(m, 99.0))
+    if m_hi < 1e-6:
+        return []
+    m_norm = np.clip(m / m_hi, 0.0, 1.0)
+
+    # Threshold to binary mask
+    binary = (m_norm >= TN_STREAK_MIN_INTENS).astype(np.uint8)
+    if binary.sum() == 0:
+        return []
+
+    # Connected components
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        binary, connectivity=8)
+
+    streak_candidates = []
+    for label_id in range(1, num_labels):  # skip background (0)
+        area = int(stats[label_id, cv2.CC_STAT_AREA])
+        if area < TN_STREAK_MIN_AREA or area > TN_STREAK_MAX_AREA:
+            continue
+
+        # Check mean intensity within the component (filter out dim noise)
+        mask = (labels == label_id)
+        mean_intens = float(m_norm[mask].mean())
+        if mean_intens < TN_STREAK_MIN_INTENS:
+            continue
+
+        # Aspect ratio via PCA on the component pixels
+        ys, xs = np.where(mask)
+        pts = np.stack([xs.astype(np.float32), ys.astype(np.float32)], axis=1)
+        if len(pts) < 5:
+            continue
+        mean_pt = pts.mean(axis=0)
+        cov = np.cov((pts - mean_pt).T)
+        if cov.ndim < 2:
+            continue
+        eigvals = np.linalg.eigvalsh(cov)
+        eigvals = np.sort(np.abs(eigvals))[::-1]
+        if eigvals[1] < 1e-6:
+            continue
+        aspect = float(eigvals[0] / eigvals[1]) ** 0.5  # sqrt so it's a length ratio
+        if aspect < TN_STREAK_MIN_ASPECT:
+            continue
+
+        # Centroid of the component
+        cx_model = float(centroids[label_id, 0])
+        cy_model = float(centroids[label_id, 1])
+        streak_candidates.append((cx_model * scale_x, cy_model * scale_y, TN_STREAK_CONF))
+
+    return streak_candidates
 
 
 # ---------------------------------------------------------------------------

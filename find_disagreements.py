@@ -308,10 +308,9 @@ def find_disagreements(data_dir: str, weights: str, visualize: bool = False,
         wandb.finish()
 
     print("\nNext steps:")
-    print("  1. Review the visualized disagreements")
-    print("  2. Decide which labels to fix (false_positives are usually bad labels)")
-    print("  3. Run apply_fixes.py (or manually edit CSVs)")
-    print("  4. Retrain: python tracknet.py --train --data ... --epochs 100 --batch 8")
+    print("  1. python interactive_label.py   (review + fix in one session)")
+    print("  2. python merge_labels.py")
+    print("  3. python tracknet.py --train --data data/tracknet_merged --epochs 40 --batch 8")
 
 
 if __name__ == "__main__":
@@ -344,12 +343,9 @@ ITERATION WORKFLOW
 ==============================================================================
 
 0) BEFORE YOU START — prerequisites
-   - A trained TrackNet checkpoint must exist. For iteration cleanup use
-     runs/tracknet/weights/best_session.pt (current iteration's best),
-     NOT best_overall.pt — the all-time best may be from an older model
-     with different failure modes than your current data.
-   - UVAMBB_DATA_ROOT must be set in .env (or passed via --data-root) so
-     the audit can resolve frame paths stored as relative "data/..." strings.
+   - A trained TrackNet checkpoint must exist. Use best_session.pt (current
+     iteration's best), NOT best_overall.pt — the all-time best may be from
+     an older model with different failure modes.
    - merge_labels.py must have been run so data/tracknet_merged/train.csv
      and val.csv exist.
 
@@ -358,17 +354,9 @@ ITERATION WORKFLOW
        --output-dir data/tracknet_autolabels_01b \
        --start-frame 5000 --max-frames 10000
    python merge_labels.py
-   python tracknet.py --preprocess --data data/tracknet_merged
 
    Note: adding raw auto-labeled frames temporarily drops F1 because they
-   carry noise. Steps 2-5 win it back.
-
-Remove-Item output\disagreements\false_negatives\game_*\* -Force
-Remove-Item output\disagreements\false_positives\game_*\* -Force
-Remove-Item output\disagreements\position_mismatch\game_*\* -Force
-Remove-Item output\disagreements\false_negatives\game_* -Force
-Remove-Item output\disagreements\false_positives\game_* -Force
-Remove-Item output\disagreements\position_mismatch\game_* -Force
+   carry noise. Steps 2-3 win it back.
 
 2) RUN AUDIT
    python find_disagreements.py --visualize --max-vis 2000
@@ -376,9 +364,8 @@ Remove-Item output\disagreements\position_mismatch\game_* -Force
    Flags:
      --data PATH           (default data/tracknet_merged)
      --weights PATH        (default runs/tracknet/weights/best_session.pt)
-     --data-root PATH      (or set UVAMBB_DATA_ROOT in .env)
      --visualize           save annotated JPGs into output/disagreements/
-     --max-vis N           per-category visualization cap (default 1000)
+     --max-vis N           per-category visualization cap (default 2000)
 
    Internal thresholds (edit as file constants if needed):
      CONF_THRESH    = 0.5   model confidence to count as a detection
@@ -386,111 +373,55 @@ Remove-Item output\disagreements\position_mismatch\game_* -Force
 
    Outputs:
      output/disagreements/
-       {train,val}_false_negatives.csv
-       {train,val}_false_positives.csv
-       {train,val}_position_mismatch.csv
-       false_negatives/{game}/{stem}.jpg
+       {train,val}_false_negatives.csv     label=none, model=ball
+       {train,val}_false_positives.csv     label=ball, model=none
+       {train,val}_position_mismatch.csv   both see ball, positions differ
+       false_negatives/{game}/{stem}.jpg   annotated at model resolution
        false_positives/{game}/{stem}.jpg
-       position_mismatch/{game}/{stem}.jpg
-   The {game} subfolder prevents cross-game stem collisions — if game_01,
-   game_02, and game_03 all have frame_001578.jpg, you see all three.
+       position_mismatch/{game}/{stem}.jpg  red=label, green=model
 
-   Narrowing the review set: if there are too many to review, raise
-   CONF_THRESH (e.g. 0.7) to see only high-confidence FN/PM, or raise
-   DIST_THRESH_PX (e.g. 25) to filter out near-miss PM.
+   Narrowing the review set: raise CONF_THRESH (e.g. 0.7) to see only
+   high-confidence FN/PM, or raise DIST_THRESH_PX (e.g. 25) to filter
+   out near-miss PM.
 
-3) MANUAL REVIEW — three folders, three decision rules:
+3) INTERACTIVE REVIEW
+   python interactive_label.py
 
-   A) false_negatives/{game}/  (label=none, model=ball)
-      KEEP image   → --add-missed inserts model's position as a new label
-      DELETE image → row stays visibility=0 (model hallucination)
+   Opens an OpenCV window — loads all disagreement CSVs, shows one frame at
+   a time. Two-stage per frame: Review then Preview (see result before saving).
+   Writes directly to fix_log.csv — no sync/apply step needed.
 
-   B) false_positives/{game}/  (label=ball, model=none)
-      KEEP image   → apply_fixes zeroes out the bad label
-      DELETE image → row stays labeled (model missed a real ball)
+   Controls (Review stage):
+     Click         Set custom ball position (cyan dot)
+     Right-click   Clear custom position
+     A             Accept → add/reposition at clicked or model pos
+     R             Remove/zero → bad label or neither-correct
+     K             Keep → no change, skip
+     N / →         Next frame (skip without action)
+     P / ←         Previous frame
+     U             Undo last fix (only unqueued entries)
+     Q / ESC       Save and quit
 
-   C) position_mismatch/{game}/  (both see ball, positions differ)
-      THREE possible outcomes:
-        - label (red) correct, model (green) wrong
-            → DELETE image (label stays as-is)
-        - model (green) more accurate than label (red)
-            → KEEP image (fix-positions overwrites label with model xy)
-        - NEITHER correct (ball elsewhere / not visible)
-            → MOVE image into position_mismatch/_neither/{game}/{stem}.jpg
-              so zero_neither_correct.py zeroes the label.
+   Controls (Preview stage):
+     Y / Enter     Confirm and log the fix
+     ESC / N       Cancel, back to review
 
-   Partial review is OK in ANY category. Track the highest reviewed stem
-   number PER CATEGORY separately — review proceeds in filename-sorted
-   order. Each category has its own --max-*-frame flag in apply_fixes.
+   Category semantics:
+     false_negatives  A=add label  R=skip(model wrong)  K=skip
+     false_positives  A/R=remove bad label  K=keep(real ball)
+     position_mismatch  A=reposition  R=zero(neither)  K=keep label
 
-4) SYNC disagreement CSVs to match what's left in the folders
-   python sync_disagreements.py
+   Filter to one category:
+     python interactive_label.py --category false_negatives
+     python interactive_label.py --category false_positives
+     python interactive_label.py --category position_mismatch
 
-   Flags:
-     --disagreements PATH  (default output/disagreements)
+   Resume is automatic (progress saved to output/disagreements/.review_progress.json).
+   Force restart: python interactive_label.py --reset-progress
 
-   Walks false_negatives/, false_positives/, position_mismatch/ and keeps
-   only CSV rows whose (game, stem) image is still present. The _neither/
-   subfolder is NOT used here — it's handled in step 5b. Backs up the
-   original disagreement CSVs to output/disagreements/backups/<ts>/.
-
-5a) APPLY FIXES
-    python apply_fixes.py --data data/tracknet_merged \
-        --fix-positions --add-missed
-
-    Flags:
-      --data PATH             (default data/tracknet_merged)
-      --disagreements PATH    (default output/disagreements)
-      --fix-positions         apply PM fixes (else PM ignored)
-      --add-missed            apply FN additions (else FN ignored)
-      --min-dist PX           only fix PM if distance >= this (default 20)
-      --min-conf FLOAT        only add FN if model conf >= this (default 0.7)
-      --max-fp-frame N        partial FP review cutoff (only stems <= N)
-      --max-pm-frame N        partial PM review cutoff
-      --max-fn-frame N        partial FN review cutoff
-      --no-backup             skip timestamped backup (NOT recommended)
-
-    FP always runs when the CSV has rows. PM and FN are opt-in via
-    --fix-positions / --add-missed. Each --max-*-frame is independent;
-    leave unset for fully-reviewed categories.
-
-    Priority per row: FP > PM > FN. A row matching multiple categories
-    only receives one treatment per run — removing a bad label wins over
-    repositioning it, which wins over adding back a missed label.
-
-    Timestamped backup lands at:
-      data/tracknet_merged/backups/<YYYYMMDD_HHMMSS>_apply_fixes/
-        train.csv  val.csv
-
-    Examples:
-      # Fully reviewed all three:
-      python apply_fixes.py --data data/tracknet_merged \
-          --fix-positions --add-missed
-
-      # PM partial to 3513, FN partial to 5000, FP fully reviewed:
-      python apply_fixes.py --data data/tracknet_merged \
-          --fix-positions --add-missed \
-          --max-pm-frame 3513 --max-fn-frame 5000
-
-      # Tighter thresholds (fix obvious PM only, add confident FN only):
-      python apply_fixes.py --data data/tracknet_merged \
-          --fix-positions --add-missed --min-dist 30 --min-conf 0.85
-
-5b) ZERO OUT "neither correct" position mismatches
-    (only if you used the _neither/ subfolder in step 3C)
-    python zero_neither_correct.py
-
-    Flags:
-      --data PATH          (default data/tracknet_merged)
-      --neither-dir PATH   (default output/disagreements/position_mismatch/_neither)
-      --list FILE          alternative: text file with "game/stem" per line
-      --no-backup          skip timestamped backup (NOT recommended)
-
-    Backup lands at:
-      data/tracknet_merged/backups/<YYYYMMDD_HHMMSS>_zero_neither/
-
-6) RETRAIN
-   python tracknet.py --train --epochs 40 --batch 8
+4) MERGE AND RETRAIN
+   python merge_labels.py
+   python tracknet.py --train --data data/tracknet_merged --epochs 40 --batch 8
 
    The .npy preprocessing cache does NOT need regeneration — it stores
    resized frames, not labels. Label changes take effect next epoch.
@@ -499,11 +430,11 @@ Remove-Item output\disagreements\position_mismatch\game_* -Force
 ROLLBACK / RECOVERY
 ==============================================================================
 
-Every mutating step takes a timestamped backup.
+merge_labels.py replays fix_log.csv after each merge, so any interactive_label
+actions are preserved across re-merges.
 
 List backups:
    ls data/tracknet_merged/backups/
-   ls output/disagreements/backups/       (disagreement CSV history)
 
 Restore a specific backup:
    cp data/tracknet_merged/backups/<YYYYMMDD_HHMMSS_tag>/*.csv \
@@ -528,23 +459,16 @@ CAVEATS AND FAQ
 - FALSE NEGATIVE COUNT LOOKS HUGE? Expected on freshly-merged auto-labeled
   data. The auto-labeler leaves visibility=0 on anything it wasn't sure
   about; the model then sees balls in those frames and flags them as FN.
-  Review normally — most are genuine misses to recover via --add-missed.
+  Review normally — most are genuine misses.
 
-- APPLY_FIXES DID NOTHING? Two common causes:
-  (a) All PM rows have distance < --min-dist (lower --min-dist)
-  (b) All FN rows have conf < --min-conf (lower --min-conf)
-  The (game, stem) keying handles path-format differences, so mismatched
-  paths shouldn't be the cause anymore.
+- AUDIT IS SLOW? --max-vis caps image writes, not CSV rows. The bottleneck
+  is running the model on every 3-frame triplet (~10 min/10k frames on GPU).
 
-- AUDIT IS SLOW? --max-vis only caps image writes, not CSV rows. The
-  bottleneck is running the model on every 3-frame triplet (~10 min/10k
-  frames on a single GPU).
+- DO I RERUN PREPROCESS AFTER CLEANING? No. Preprocess caches resized frame
+  images; label edits don't touch those files. Rerun only when adding NEW
+  frames or changing INPUT_W/H.
 
-- DO I RERUN PREPROCESS AFTER CLEANING? No. Preprocess caches resized
-  frame images keyed by filename; label edits don't touch those files.
-  Rerun preprocess only when adding NEW frames or changing INPUT_W/H.
-
-- WHEN TO STOP ITERATING? F1 plateaus for 2-3 iterations in a row, or
-  the audit finds <1% disagreements. Label noise is then below the
-  model's own noise floor and further cleaning won't help.
+- WHEN TO STOP ITERATING? F1 plateaus for 2-3 iterations in a row, or the
+  audit finds <1% disagreements. Label noise is then below the model's own
+  noise floor.
 '''
