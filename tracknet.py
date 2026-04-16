@@ -65,6 +65,12 @@ VIS_LAMBDA = 0.1          # weight of vis BCE loss relative to heatmap focal los
                           # Keep low so heatmap training dominates while vis_head bootstraps
 VIS_THRESH_INFER = 0.25   # below this vis_prob at inference → return [] (no ball)
 
+# V4 output-level motion alignment: penalise predictions on stationary background
+# during training, closing the train/inference gap left by the motion gate in
+# postprocess_heatmap. Targets the precision problem (FP on court logos, shoes).
+# Weight kept low — focal loss must still dominate so heatmap regression is stable.
+MOTION_PENALTY = 0.15     # weight of stationary-background penalty loss
+
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, kernel_size=3, pad=1,
@@ -939,10 +945,12 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                 "effective_batch": eff_batch,
                 "lr": 1e-4,
                 "weight_decay": 1e-4,
-                "scheduler": "CosineAnnealingLR",
+                "scheduler": "CosineAnnealingWarmRestarts",
                 "optimizer": "AdamW",
                 "amp": use_amp,
                 "early_stop_patience": early_stop_pat,
+                "motion_penalty": MOTION_PENALTY,
+                "vis_lambda": VIS_LAMBDA,
                 "data_dir": data_dir,
                 "train_samples": len(train_ds),
                 "val_samples": len(val_ds) if val_ds else 0,
@@ -954,6 +962,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
         # --- Train ---
         model.train()
         train_loss = 0.0
+        motion_pen_total = 0.0
         optimizer.zero_grad(set_to_none=True)
 
         for batch_idx, (inp, target, vis_flags, _game) in enumerate(train_loader):
@@ -963,8 +972,23 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 hmap_out, vis_out = model(inp)
+
+                # V4 output-level motion alignment loss:
+                # Penalise the model for firing on stationary background regions.
+                # diff12 (input channel 10) is near-zero on static distractors
+                # (court logos, shoes) — we want predictions there to also be
+                # near-zero. This closes the training/inference gap: inference
+                # already suppresses these via the motion_floor gate in
+                # postprocess_heatmap; now training does the same explicitly.
+                diff12 = inp[:, 10:11, :, :]                              # (B,1,H,W)
+                m_max  = diff12.amax(dim=[2, 3], keepdim=True).clamp(min=1e-5)
+                m_norm = (diff12 / m_max).clamp(0.0, 1.0)                 # per-sample norm
+                static_bg = (1.0 - m_norm) * (target < 0.1).float()      # stationary + no ball
+                motion_pen = (torch.sigmoid(hmap_out) * static_bg).mean()
+
                 loss = (focal_loss(hmap_out, target)
-                        + VIS_LAMBDA * vis_bce_loss(vis_out, vis_flags)) / accum_steps
+                        + VIS_LAMBDA    * vis_bce_loss(vis_out, vis_flags)
+                        + MOTION_PENALTY * motion_pen) / accum_steps
 
             scaler.scale(loss).backward()
 
@@ -976,21 +1000,23 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
-            train_loss += loss.item() * accum_steps  # undo the /accum_steps for logging
+            train_loss     += loss.item() * accum_steps  # undo the /accum_steps for logging
+            motion_pen_total += motion_pen.item()
 
             if batch_idx % 20 == 0:
                 print(f"  Epoch {epoch+1}/{epochs}  "
                       f"batch {batch_idx}/{len(train_loader)}  "
                       f"loss={loss.item() * accum_steps:.4f}")
 
-        avg_train = train_loss / max(len(train_loader), 1)
+        avg_train      = train_loss      / max(len(train_loader), 1)
+        avg_motion_pen = motion_pen_total / max(len(train_loader), 1)
 
         # --- Validate + PE metric in a single pass ---
         if val_loader:
             pe = evaluate_pe(model, val_loader, device,
                              pe_thresh=5.0, conf_thresh=0.5)
             print(f"Epoch {epoch+1}/{epochs}  "
-                  f"train_loss={avg_train:.4f}  "
+                  f"train_loss={avg_train:.4f}  motion_pen={avg_motion_pen:.4f}  "
                   f"val_loss(diag)={pe['val_loss']:.4f}  "
                   f"prec={pe['precision']:.3f}  rec={pe['recall']:.3f}  "
                   f"F1={pe['f1']:.3f}  margin={pe['margin']:.3f}  "
@@ -1003,6 +1029,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                 log_dict = {
                     "epoch": epoch + 1,
                     "train/loss": avg_train,
+                    "train/motion_penalty": avg_motion_pen,
                     "val/loss_diagnostic": pe["val_loss"],
                     "val/precision": pe["precision"],
                     "val/recall": pe["recall"],

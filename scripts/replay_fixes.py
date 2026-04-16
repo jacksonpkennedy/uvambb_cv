@@ -14,8 +14,8 @@ import argparse
 import csv
 from pathlib import Path
 
-import fix_log
-from csv_backup import backup_csvs
+import scripts.fix_log as fix_log
+from scripts.csv_backup import backup_csvs
 
 
 def main():

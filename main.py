@@ -2115,7 +2115,7 @@ if __name__ == "__main__":
         if args.tracknet_data:
             tn_data_dir = args.tracknet_data
         else:
-            from convert_labels import convert
+            from scripts.convert_labels import convert
             print("Converting YOLO labels → TrackNet format ...")
             convert("data/custom_annotations", "data/tracknet_labels")
             tn_data_dir = "data/tracknet_labels"

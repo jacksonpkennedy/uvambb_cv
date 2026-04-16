@@ -125,7 +125,7 @@ def _flush_fix_log() -> None:
     if not _fix_log_queue:
         return
     sys.path.insert(0, ".")
-    import fix_log as fl
+    import scripts.fix_log as fl
     fl.append(DATA_DIR, _fix_log_queue)
     print(f"  Written {len(_fix_log_queue)} entries to fix_log.csv")
     _fix_log_queue.clear()

@@ -20,7 +20,7 @@ Output:
 import csv
 from pathlib import Path
 
-import fix_log
+import scripts.fix_log as fix_log
 
 SOURCES = [
     "data/tracknet_labels/train.csv",
