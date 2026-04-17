@@ -13,7 +13,9 @@ import argparse
 import csv
 import math
 import os
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import cv2
 import numpy as np

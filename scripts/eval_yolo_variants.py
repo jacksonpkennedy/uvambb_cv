@@ -44,8 +44,21 @@ def main():
         print('No weight files provided or found. Pass --weights PATHS or place checkpoints in runs/detect/train/weights or project root.')
         return
 
-    # Import evaluate_models and use its functions
-    import evaluate_models
+    # Import evaluate_models and use its functions (robust to file moves)
+    try:
+        import evaluate_models as evaluate_models
+    except Exception:
+        try:
+            import scripts.evaluate_models as evaluate_models
+        except Exception:
+            import importlib.util
+            em_path = Path('.') / 'scripts' / 'evaluate_models.py'
+            if em_path.exists():
+                spec = importlib.util.spec_from_file_location('evaluate_models', str(em_path))
+                evaluate_models = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(evaluate_models)
+            else:
+                raise ImportError('evaluate_models module not found in repo root or scripts/')
 
     rows = []
     for w in weights:

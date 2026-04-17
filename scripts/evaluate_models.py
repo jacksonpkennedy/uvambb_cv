@@ -3,7 +3,7 @@
 Outputs:
   - YOLO: per-class F1 at optimal confidence threshold (Roboflow val set)
   - YOLO on TrackNet val: apples-to-apples comparison on same game footage
-  - TrackNet: F1/precision/recall swept across heatmap thresholds (PE ≤ 5px)
+    - TrackNet: F1/precision/recall swept across heatmap thresholds (PE ≤ 10px)
 
 Usage:
     python evaluate_models.py
@@ -19,12 +19,12 @@ YOLO_WEIGHTS     = "runs/detect/train/weights/best.pt"
 YOLO_DATA        = "data/custom_annotations/data.yaml"
 TRACKNET_WEIGHTS = "runs/tracknet/weights/best_overall.pt"
 TRACKNET_DATA    = "data/tracknet_merged"
-PE_THRESH        = 5.0      # pixels at model resolution (TrackNet paper standard)
+PE_THRESH        = 10.0     # pixels at model resolution (reporting threshold)
 INPUT_W, INPUT_H = 640, 360 # TrackNet model resolution
 YOLO_BALL_CLS    = 0        # 'basketball' class index in fine-tuned YOLO
 
 # Import architectural constant so summary can reference it
-import sys as _sys; _sys.path.insert(0, ".")
+import sys as _sys; _sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 from tracknet import VIS_THRESH_INFER
 
 

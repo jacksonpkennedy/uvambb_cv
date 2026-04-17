@@ -204,10 +204,12 @@ class TrackNetV3(nn.Module):
         # (0.01 or 0.99) that Kaiming init produces, avoiding massive initial
         # loss from the (pred^2 * log(1-pred)) term on background pixels.
         nn.init.normal_(self.conv18.weight, mean=0, std=0.001)
-        nn.init.constant_(self.conv18.bias, -0.5)  # sigmoid(-0.5)=0.38, mild no-ball prior
-        # (was -2.0 when data was ~50/50 visible/empty; now 77% visible after
-        # cleaning 10K+ false negatives — a strong negative prior fights the
-        # gradient for too many early epochs)
+        nn.init.constant_(self.conv18.bias, -1.0)  # sigmoid(-1.0)=0.27, calibrated no-ball prior
+        # -0.5 (sigmoid=0.38) was too weak: with ~0.17% positive pixels the model
+        # starts with a large focal loss on background, slowing the first few epochs.
+        # -1.0 (sigmoid=0.27) is better calibrated without being as extreme as
+        # the old -2.0 (which was set when data was ~50/50 and over-suppressed
+        # valid ball detections in the early training phase).
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +474,7 @@ def focal_loss(pred_logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 def evaluate_pe(model: "TrackNetV3", loader, device: str,
-                pe_thresh: float = 5.0,
+                pe_thresh: float = 10.0,
                 conf_thresh: float = 0.5) -> dict:
     """Compute val_loss + precision/recall/F1 in a single val pass.
 
@@ -741,6 +743,31 @@ class TrackNetDataset(Dataset):
                 if cx >= 0:
                     cx = INPUT_W - 1 - cx
 
+            # Color jitter (HSV) + contrast — consistent across all 3 frames
+            # Hue shift +/-15 deg, saturation scale 0.7-1.4, value scale 0.8-1.2
+            hue_shift = pyrandom.uniform(-15.0, 15.0)
+            sat_scale = pyrandom.uniform(0.5, 1.6)   # wider: 0.7-1.4 → 0.5-1.6 for cross-game generalization
+            val_scale = pyrandom.uniform(0.8, 1.2)
+            contrast = pyrandom.uniform(0.75, 1.3)   # wider: 0.9-1.1 → 0.75-1.3 (SimCLR/RandAugment range)
+
+            def _apply_hsv_contrast(f):
+                # f: (3, H, W) float32 in BGR order, values in [0,1]
+                f_hwc = np.transpose(f, (1, 2, 0))
+                img_uint8 = np.clip(f_hwc * 255.0, 0, 255).astype(np.uint8)
+                hsv = cv2.cvtColor(img_uint8, cv2.COLOR_BGR2HSV).astype(np.float32)
+                # OpenCV hue range: 0..179
+                h_shift_cv2 = int(hue_shift * 179.0 / 360.0)
+                hsv[..., 0] = (hsv[..., 0].astype(np.int32) + h_shift_cv2) % 180
+                hsv[..., 1] = np.clip(hsv[..., 1] * sat_scale, 0, 255)
+                hsv[..., 2] = np.clip(hsv[..., 2] * val_scale, 0, 255)
+                bgr = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR).astype(np.float32) / 255.0
+                bgr = np.clip((bgr - 0.5) * contrast + 0.5, 0.0, 1.0)
+                return np.transpose(bgr.astype(np.float32), (2, 0, 1))
+
+            f0 = _apply_hsv_contrast(f0)
+            f1 = _apply_hsv_contrast(f1)
+            f2 = _apply_hsv_contrast(f2)
+
             # Brightness jitter [0.7, 1.3]
             b = pyrandom.uniform(0.7, 1.3)
             f0 = np.clip(f0 * b, 0.0, 1.0)
@@ -748,13 +775,12 @@ class TrackNetDataset(Dataset):
             f2 = np.clip(f2 * b, 0.0, 1.0)
 
             # Independent Gaussian noise per frame (std=0.02)
-            # Single allocation for all 3 frames — ~3x faster than separate calls
             noise = np.random.normal(0, 0.02, (3, *f0.shape)).astype(np.float32)
             f0 = np.clip(f0 + noise[0], 0.0, 1.0)
             f1 = np.clip(f1 + noise[1], 0.0, 1.0)
             f2 = np.clip(f2 + noise[2], 0.0, 1.0)
 
-            # Motion blur (30% chance) — simulates fast ball during shots/passes
+            # Motion blur (30% chance) — apply same kernel to all frames
             if pyrandom.random() < 0.3:
                 ksize = pyrandom.choice([5, 7, 9, 11])
                 kernel = np.zeros((ksize, ksize), dtype=np.float32)
@@ -762,8 +788,15 @@ class TrackNetDataset(Dataset):
                     kernel[ksize // 2, :] = 1.0 / ksize   # horizontal
                 else:
                     kernel[:, ksize // 2] = 1.0 / ksize   # vertical
+                # Apply to each frame (HWC float32)
+                f0_hwc = np.transpose(f0, (1, 2, 0))
+                f1_hwc = np.transpose(f1, (1, 2, 0))
                 f2_hwc = np.transpose(f2, (1, 2, 0))
+                f0_hwc = cv2.filter2D(f0_hwc, -1, kernel)
+                f1_hwc = cv2.filter2D(f1_hwc, -1, kernel)
                 f2_hwc = cv2.filter2D(f2_hwc, -1, kernel)
+                f0 = np.transpose(f0_hwc, (2, 0, 1)).astype(np.float32)
+                f1 = np.transpose(f1_hwc, (2, 0, 1)).astype(np.float32)
                 f2 = np.transpose(f2_hwc, (2, 0, 1)).astype(np.float32)
 
         # Motion diff maps (V4): |frame_{t-1} - frame_{t-2}| and |frame_t - frame_{t-1}|
@@ -799,7 +832,9 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
                    resume: bool = False,
                    accum_steps: int = 2,
                    data_root: str | None = None,
-                   seed: int = 42):
+                   seed: int = 42,
+                   train_csv: str | None = None,
+                   val_csv: str | None = None):
     """Train TrackNetV3 on basketball frame sequences.
 
     Args:
@@ -819,8 +854,8 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    train_csv = str(Path(data_dir) / "train.csv")
-    val_csv   = str(Path(data_dir) / "val.csv")
+    train_csv = train_csv or str(Path(data_dir) / "train.csv")
+    val_csv   = val_csv   or str(Path(data_dir) / "val.csv")
 
     print("Building training dataset ...")
     train_ds = TrackNetDataset(train_csv, oversample_visible=False, augment=True,
@@ -862,19 +897,22 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
     # AdamW: decoupled weight decay generalises better than L2 in Adam
     # (Loshchilov & Hutter 2019), especially with cosine schedulers.
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4,
-                                  weight_decay=1e-4)
-    # lr 2e-4→1e-4: empirically best run used 1e-4 (F1=0.524). 2e-4 overshoots
-    # on the small ball heatmap task.
-    # wd 5e-4→1e-4: lower weight decay lets the model fit clean labels better;
-    # heavy regularization was compensating for label noise that no longer exists.
+                                  weight_decay=1e-3)
+    # lr: 1e-4 empirically best (F1=0.524). 2e-4 overshoots on this heatmap task.
+    # wd: raised from 1e-4 → 1e-3 (Loshchilov & Hutter 2019 recommend 0.01–0.05;
+    # 1e-4 is below the lower bound). verified_train.csv is ~7.5k sequences —
+    # a small clean dataset where overfitting risk is higher than label-noise risk,
+    # so stronger regularization is now correct.
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=10, T_mult=2, eta_min=1e-6)
-    # CosineAnnealingWarmRestarts: LR restarts at epoch 10, then 30, then 70...
+        optimizer, T_0=20, T_mult=2, eta_min=1e-6)
+    # CosineAnnealingWarmRestarts: LR restarts at epoch 20, then 60, then 140...
     # Each cycle is T_mult=2x longer than the last.
-    # Why: CosineAnnealingLR decayed to near-zero by epoch 21 in the best prior
-    # run, causing F1 to plateau then decline — the model ran out of useful LR.
-    # Warm restarts give a fresh exploratory phase after each cycle so the model
-    # keeps improving on newly cleaned data rather than freezing in place.
+    # T_0 raised 10→20: with ~7.5k sequences at batch 8 (~940 steps/epoch), T_0=10
+    # gave only 9,400 gradient steps before the first restart — cosine had decayed
+    # to ~1e-5 by epoch 5, leaving the model at near-zero LR for the second half
+    # before it had converged. SGDR (Loshchilov & Hutter 2017) recommends T_0
+    # large enough to reach a reasonable local minimum in the first cycle.
+    # T_0=20 gives ~18,800 steps before restart, matching that intent.
 
     use_amp = device != "cpu"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -1014,7 +1052,7 @@ def train_tracknet(data_dir: str, epochs: int = 100, batch_size: int = 8,
         # --- Validate + PE metric in a single pass ---
         if val_loader:
             pe = evaluate_pe(model, val_loader, device,
-                             pe_thresh=5.0, conf_thresh=0.5)
+                             pe_thresh=10.0, conf_thresh=0.5)
             print(f"Epoch {epoch+1}/{epochs}  "
                   f"train_loss={avg_train:.4f}  motion_pen={avg_motion_pen:.4f}  "
                   f"val_loss(diag)={pe['val_loss']:.4f}  "
@@ -1284,6 +1322,82 @@ def preprocess_frames(data_dir: str) -> None:
     print(f"Done: {done} saved as .npy, {skipped} already cached.")
 
 
+def sweep_conf_thresh(
+    weights: str,
+    data_dir: str,
+    val_csv: str | None = None,
+    device: str = "cuda:0",
+    num_workers: int = 4,
+    batch_size: int = 8,
+    data_root: str | None = None,
+    conf_min: float = 0.10,
+    conf_max: float = 0.90,
+    conf_step: float = 0.05,
+) -> None:
+    """Sweep conf_thresh on the val set and report F1 for each value.
+
+    Loads the model once, then re-evaluates with each threshold — fast
+    because evaluate_pe only does inference + metric accumulation.
+    """
+    val_csv = val_csv or str(Path(data_dir) / "val.csv")
+    if not Path(val_csv).exists():
+        print(f"ERROR: val CSV not found: {val_csv}")
+        return
+    if not Path(weights).exists():
+        print(f"ERROR: weights not found: {weights}")
+        return
+
+    print(f"Loading model from {weights} ...")
+    model = TrackNetV3().to(device)
+    state = torch.load(weights, map_location=device, weights_only=True)
+    missing, _ = model.load_state_dict(state, strict=False)
+    if missing:
+        print(f"  {len(missing)} missing keys (architecture mismatch)")
+    model.eval()
+    torch.backends.cudnn.benchmark = True
+
+    print(f"Loading val dataset: {val_csv}")
+    val_ds = TrackNetDataset(val_csv, augment=False, data_root=data_root)
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False,
+        num_workers=0,
+        pin_memory=(device != "cpu"),
+    )
+
+    thresholds = []
+    t = conf_min
+    while t <= conf_max + 1e-9:
+        thresholds.append(round(t, 4))
+        t += conf_step
+
+    print(f"\nSweeping conf_thresh {conf_min:.2f} -> {conf_max:.2f} "
+          f"(step {conf_step:.2f})  |  {len(thresholds)} values\n")
+    header = f"{'conf':>6}  {'prec':>6}  {'rec':>6}  {'F1':>6}  {'TP':>6}  {'FP':>6}  {'FN':>6}"
+    print(header)
+    print("-" * len(header))
+
+    best_f1, best_conf = 0.0, 0.0
+    results = []
+    for thresh in thresholds:
+        pe = evaluate_pe(model, val_loader, device,
+                         pe_thresh=10.0, conf_thresh=thresh)
+        f1   = pe["f1"]
+        prec = pe["precision"]
+        rec  = pe["recall"]
+        tp, fp, fn = pe["tp"], pe["fp"], pe["fn"]
+        marker = " <--" if f1 > best_f1 else ""
+        print(f"{thresh:>6.2f}  {prec:>6.3f}  {rec:>6.3f}  {f1:>6.3f}"
+              f"  {tp:>6}  {fp:>6}  {fn:>6}{marker}")
+        results.append((thresh, prec, rec, f1, tp, fp, fn))
+        if f1 > best_f1:
+            best_f1   = f1
+            best_conf = thresh
+
+    print("-" * len(header))
+    print(f"\nBest conf_thresh = {best_conf:.2f}  (F1 = {best_f1:.3f})")
+    print(f"\nTo apply: set TRACKNET_CONF_THRESH = {best_conf} in main.py")
+
+
 if __name__ == "__main__":
     import os
     from dotenv import load_dotenv
@@ -1311,16 +1425,42 @@ if __name__ == "__main__":
                         help="Resume training from last_ckpt.pt checkpoint")
     parser.add_argument("--seed", type=int, default=6050,
                         help="Random seed for reproducibility (default 6050)")
+    parser.add_argument("--train-csv", default=None,
+                        help="Override train CSV path (default: <data>/train.csv)")
+    parser.add_argument("--val-csv", default=None,
+                        help="Override val CSV path (default: <data>/val.csv)")
+    parser.add_argument("--sweep-conf", action="store_true",
+                        help="Sweep conf_thresh on val set to find optimal threshold")
+    parser.add_argument("--weights", default="runs/tracknet/weights/best_overall.pt",
+                        help="Weights for --sweep-conf (default: best_overall.pt)")
+    parser.add_argument("--conf-min",  type=float, default=0.10)
+    parser.add_argument("--conf-max",  type=float, default=0.90)
+    parser.add_argument("--conf-step", type=float, default=0.05)
     args = parser.parse_args()
 
     if args.preprocess:
         preprocess_frames(args.data)
+    elif args.sweep_conf:
+        sweep_conf_thresh(
+            weights=args.weights,
+            data_dir=args.data,
+            val_csv=args.val_csv,
+            device=args.device,
+            num_workers=args.workers,
+            batch_size=args.batch,
+            data_root=args.data_root,
+            conf_min=args.conf_min,
+            conf_max=args.conf_max,
+            conf_step=args.conf_step,
+        )
     elif args.train:
         train_tracknet(args.data, epochs=args.epochs, batch_size=args.batch,
                        device=args.device,
                        num_workers=args.workers, resume=args.resume,
                        accum_steps=args.accum,
                        data_root=args.data_root,
-                       seed=args.seed)
+                       seed=args.seed,
+                       train_csv=args.train_csv,
+                       val_csv=args.val_csv)
     else:
-        print("Use --train or --preprocess. See --help for options.")
+        print("Use --train, --sweep-conf, or --preprocess. See --help for options.")

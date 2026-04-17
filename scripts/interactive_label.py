@@ -316,7 +316,23 @@ _click_pt: tuple | None = None
 def _mouse_cb(event, x, y, flags, param):
     global _click_pt
     if event == cv2.EVENT_LBUTTONDOWN:
-        _click_pt = (x // DISPLAY_SCALE, y // DISPLAY_SCALE)
+        # Use actual window image rect so resizing / maximizing the window
+        # doesn't corrupt coordinates.  getWindowImageRect returns
+        # (x_offset, y_offset, width, height) of the rendered image inside
+        # the window; width/height reflect the true display scale.
+        rect = cv2.getWindowImageRect("TrackNet Labeler")
+        disp_w, disp_h = rect[2], rect[3]
+        if disp_w > 0 and disp_h > 0:
+            model_x = int((x - rect[0]) * MODEL_W / disp_w)
+            model_y = int((y - rect[1]) * MODEL_H / disp_h)
+        else:
+            # Fallback if rect not yet available
+            model_x = x // DISPLAY_SCALE
+            model_y = y // DISPLAY_SCALE
+        _click_pt = (
+            max(0, min(MODEL_W - 1, model_x)),
+            max(0, min(MODEL_H - 1, model_y)),
+        )
     elif event == cv2.EVENT_RBUTTONDOWN:
         _click_pt = None
 

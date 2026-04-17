@@ -32,7 +32,21 @@ def main():
         return
 
     # Import the evaluator utility (evaluate_models.eval_tracknet)
-    import scripts.evaluate_models as evaluate_models
+    # Robust import: try top-level, then scripts package, then load from file path.
+    try:
+        import evaluate_models as evaluate_models
+    except Exception:
+        try:
+            import scripts.evaluate_models as evaluate_models
+        except Exception:
+            import importlib.util, sys
+            em_path = root / 'scripts' / 'evaluate_models.py'
+            if em_path.exists():
+                spec = importlib.util.spec_from_file_location('evaluate_models', str(em_path))
+                evaluate_models = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(evaluate_models)
+            else:
+                raise ImportError('evaluate_models module not found in repo root or scripts/')
 
     results = []
     for pt in pt_files:

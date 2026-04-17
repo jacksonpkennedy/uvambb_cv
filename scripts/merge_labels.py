@@ -20,7 +20,14 @@ Output:
 import csv
 from pathlib import Path
 
-import scripts.fix_log as fix_log
+try:
+    import scripts.fix_log as fix_log
+except Exception:
+    # Running as a script file (python scripts/merge_labels.py) sets
+    # sys.path[0] to the scripts/ directory, which makes absolute
+    # package imports like 'scripts.fix_log' fail. Fall back to the
+    # local module so both invocation styles work.
+    import fix_log as fix_log
 
 SOURCES = [
     "data/tracknet_labels/train.csv",
