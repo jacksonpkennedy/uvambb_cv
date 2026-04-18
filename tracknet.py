@@ -1192,6 +1192,11 @@ class TrackNetInference:
             if missing:
                 print(f"TrackNet: {len(missing)} missing keys "
                       f"(new architecture — retrain recommended)")
+                # vis_head missing → random weights → bypass vis gate to avoid
+                # random frame drops on old checkpoints
+                if any("vis_head" in k for k in missing):
+                    self.vis_thresh = 0.0
+                    print("TrackNet: vis_head missing — vis gate disabled")
             if unexpected:
                 print(f"TrackNet: {len(unexpected)} unexpected keys ignored")
             print(f"TrackNet: loaded weights from {weights_path}")
@@ -1334,11 +1339,7 @@ def sweep_conf_thresh(
     conf_max: float = 0.90,
     conf_step: float = 0.05,
 ) -> None:
-    """Sweep conf_thresh on the val set and report F1 for each value.
-
-    Loads the model once, then re-evaluates with each threshold — fast
-    because evaluate_pe only does inference + metric accumulation.
-    """
+    """Sweep conf_thresh on the val set — single inference pass, threshold in memory."""
     val_csv = val_csv or str(Path(data_dir) / "val.csv")
     if not Path(val_csv).exists():
         print(f"ERROR: val CSV not found: {val_csv}")
@@ -1364,31 +1365,64 @@ def sweep_conf_thresh(
         pin_memory=(device != "cpu"),
     )
 
+    # Single inference pass — collect (pred_conf, pred_x, pred_y, gt_x, gt_y, has_ball)
+    print("Running inference (single pass)...")
+    records = []
+    use_amp = device != "cpu"
+    with torch.no_grad(), torch.amp.autocast("cuda", enabled=use_amp):
+        for inp, target, vis_flags, _ in val_loader:
+            inp = inp.to(device, non_blocking=True)
+            out, _ = model(inp)
+            pred_np   = torch.sigmoid(out).cpu().numpy()
+            target_np = target.numpy()
+            vis_np    = vis_flags.numpy()
+            for b in range(pred_np.shape[0]):
+                has_ball   = int(vis_np[b]) > 0
+                pred_hmap  = pred_np[b, 0]
+                pred_conf  = float(pred_hmap.max())
+                pr_y, pr_x = divmod(int(pred_hmap.argmax()), INPUT_W)
+                if has_ball:
+                    gt_hmap    = target_np[b, 0]
+                    gt_y, gt_x = divmod(int(gt_hmap.argmax()), INPUT_W)
+                else:
+                    gt_x = gt_y = -1
+                records.append((pred_conf, pr_x, pr_y, gt_x, gt_y, has_ball))
+    print(f"  {len(records)} frames collected. Peak conf range: "
+          f"{min(r[0] for r in records):.3f} - {max(r[0] for r in records):.3f}\n")
+
     thresholds = []
     t = conf_min
     while t <= conf_max + 1e-9:
         thresholds.append(round(t, 4))
         t += conf_step
 
-    print(f"\nSweeping conf_thresh {conf_min:.2f} -> {conf_max:.2f} "
+    print(f"Sweeping conf_thresh {conf_min:.2f} -> {conf_max:.2f} "
           f"(step {conf_step:.2f})  |  {len(thresholds)} values\n")
     header = f"{'conf':>6}  {'prec':>6}  {'rec':>6}  {'F1':>6}  {'TP':>6}  {'FP':>6}  {'FN':>6}"
     print(header)
     print("-" * len(header))
 
     best_f1, best_conf = 0.0, 0.0
-    results = []
     for thresh in thresholds:
-        pe = evaluate_pe(model, val_loader, device,
-                         pe_thresh=10.0, conf_thresh=thresh)
-        f1   = pe["f1"]
-        prec = pe["precision"]
-        rec  = pe["recall"]
-        tp, fp, fn = pe["tp"], pe["fp"], pe["fn"]
+        tp = fp = fn = 0
+        for pred_conf, pr_x, pr_y, gt_x, gt_y, has_ball in records:
+            pred_detect = pred_conf >= thresh
+            if pred_detect and has_ball:
+                dist = math.hypot(pr_x - gt_x, pr_y - gt_y)
+                if dist <= 10.0:
+                    tp += 1
+                else:
+                    fp += 1; fn += 1
+            elif pred_detect:
+                fp += 1
+            elif has_ball:
+                fn += 1
+        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        f1   = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
         marker = " <--" if f1 > best_f1 else ""
         print(f"{thresh:>6.2f}  {prec:>6.3f}  {rec:>6.3f}  {f1:>6.3f}"
               f"  {tp:>6}  {fp:>6}  {fn:>6}{marker}")
-        results.append((thresh, prec, rec, f1, tp, fp, fn))
         if f1 > best_f1:
             best_f1   = f1
             best_conf = thresh

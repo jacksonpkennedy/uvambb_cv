@@ -9,3 +9,5 @@ test.mp4
 .env
 wandb/
 handoff.md
+label_check
+.ecr*

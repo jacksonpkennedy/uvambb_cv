@@ -31,7 +31,7 @@ from tracknet import INPUT_W, INPUT_H
 # ---------------------------------------------------------------------------
 
 FINETUNED_WEIGHTS   = "runs/detect/train/weights/best.pt"
-TRACKNET_WEIGHTS    = "runs/tracknet/weights/best_session.pt"
+TRACKNET_WEIGHTS    = "runs/tracknet/weights/best_consistency.pt"
 DEFAULT_VIDEO       = "data/game_04_TEST_clip.mp4"
 OUT_DIR             = "output/demos"
 DEFAULT_MOTION_OUT  = "output/demos/motion_diff"
