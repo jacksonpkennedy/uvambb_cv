@@ -31,14 +31,14 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
                                               │
           ┌───────────────────────────────────┼──────────────────────┐
           │                                   │                      │
-   ┌──────▼──────────────┐      ┌─────────────▼──────────────┐      │
-   │  FINE-TUNED YOLO11s │      │     TRACKNET (PRIMARY)     │      │
+   ┌──────▼──────────────┐      ┌─────────────▼───────────────┐      │
+   │  FINE-TUNED YOLO11s │      │     TRACKNET (PRIMARY)      │      │
    │  Detection+Tracking │      │  3-frame heatmap regression │      │
    │  4 cls + ByteTrack  │      │  11-ch input (RGB + motion) │      │
-   │                     │      │  Runs EVERY frame for        │      │
-   │  Players, Refs,     │      │  sliding window sync         │      │
-   │  Hoops              │      │  TTA (horizontal flip avg)   │      │
-   └──────┬──────────────┘      └─────────────┬──────────────┘      │
+   │                     │      │  Runs EVERY frame for       │      │
+   │  Players, Refs,     │      │  sliding window sync        │      │
+   │  Hoops              │      │  TTA (horizontal flip avg)  │      │
+   └──────┬──────────────┘      └─────────────┬───────────────┘      │
           │                                   │                      │
           │                        ┌──────────▼───────────────┐      │
           │                        │     BALL VALIDATION      │      │
@@ -56,7 +56,7 @@ A basketball analysis pipeline that detects, tracks, and annotates players, refe
                                    │
           ┌────────────────────────┼──────────────────────────────┐
           │                        │                              │
-   ┌──────▼──────────────┐  ┌─────▼────────────────┐  ┌─────────▼──────────────┐
+   ┌──────▼──────────────┐  ┌──────▼───────────────┐  ┌───────────▼────────────┐
    │  PLAYER PROCESSING  │  │    BALL TRACKING     │  │   POSE ESTIMATION      │
    │                     │  │                      │  │                        │
    │  Re-ID (jersey+prox)│  │  BallTracker (Kalman)│  │   YOLO11n-pose         │
